@@ -90,6 +90,16 @@ group 时不能开始正式 5-fold。
 batch size、normalization、resampling strategy 和 anisotropy handling。不能提前
 猜测 planner 如何处理少量 z slice，必须以实际 JSON 为准。
 
+使用项目脚本生成可放入实验报告的实际 planner 摘要：
+
+~~~powershell
+python scripts/report_planner.py
+~~~
+
+它会读取 fingerprint 和 plans，记录当前 `3d_fullres` 的 target spacing、patch
+size、batch size、normalization、resampling、transpose 以及各病例 spacing 的
+各向异性描述；缺少 JSON 时会阻断，不会生成猜测值。
+
 ## 6. 五折训练
 
 ~~~powershell

@@ -104,6 +104,16 @@ nnUNetv2_plan_and_preprocess -h
     workspace/nnUNet_preprocessed/Dataset501_CondyleMRI/dataset_fingerprint.json
     workspace/nnUNet_preprocessed/Dataset501_CondyleMRI/nnUNetPlans.json
 
+用项目脚本把实际 planner 决定整理到报告（没有这两个 JSON 时脚本会阻断）：
+
+~~~powershell
+python scripts/report_planner.py
+~~~
+
+报告会记录 median image size、spacing、target spacing、patch size、batch size、
+normalization、resampling 和当前 MRI 的 anisotropy 描述；这些值全部来自本次
+官方 planner 输出，不由项目手工覆盖。
+
 正式训练只使用官方命令和 3d_fullres：
 
 ~~~powershell
