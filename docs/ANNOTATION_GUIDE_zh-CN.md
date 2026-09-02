@@ -49,35 +49,33 @@ python scripts/dicom_to_nifti.py C:/private/one_case --case-id case_001
 文件名排序，而是使用 DICOM Series reader。如果有多条序列，按 inspect_dicom.py
 显示的匿名 series_index 选择。
 
-## 5. 选择 MRI 并创建标注
+## 5. 选择 MRI 并开始工作
 
-1. 在 TMJ Condyle Annotator 的 MRI volume 下拉框中选择 MRI。
-2. 在匿名 case id 中填写 case_001 形式的名称。
-3. 如果要自动更新 manifest，填写私有的 workspace/dataset_manifest.csv 路径。
-4. 点击“创建下颌髁突标注”。
+打开“下颌髁突三维标注”后，按顶部固定的四步导航操作：
 
-此时模块会自动创建一个唯一的 segment：
+1. 在“导入核磁”页面点击“选择 MRI”，或使用已经加载的当前病例。
+2. 确认病例编号（例如 `case_001`），点击“下一步：开始标注”。
+3. 模块会自动创建唯一的“下颌髁突”标注，并把当前 MRI 设置为参考图像。
 
-    Mandibular Condyle
+模块将标注编辑器直接嵌入本页面，整个流程不会跳转到 Slicer 原生 Segment Editor。
+导出的 mask 应与 MRI 具有相同的 shape、spacing、origin 和 direction。
 
-同时把当前 MRI 设置为 reference geometry。这意味着导出的 mask 应与 MRI 有相同
-的 shape、spacing、origin 和 direction。
+## 6. 在工作台中逐层标注
 
-## 6. 打开 Segment Editor
+步骤 2 会一直显示中文引导、病例卡片、当前工具、当前切片和下一步按钮。页面的
+主要标注视图会自动选择原始图像中层数最少的稀疏方向；例如 `512×512×8` 数据会
+显示“第 X / 8 层”，这不代表其它两个方向也只有 8 层。
 
-点击“开始标注（打开 Segment Editor）”。Slicer 会切换到原生 Segment Editor。
-请只编辑 Mandibular Condyle 这个 segment。
+常用工具只有两个：
 
-常用工具：
+- **画笔**：在当前切片上涂出下颌髁突。
+- **擦除**：擦除涂错的部分。
 
-- Paint：在当前切片上涂画。
-- Erase：擦除涂错的部分。
-- Draw：画封闭轮廓。
-- Scissors：裁掉一块明显错误的区域。
-- Islands：查看、删除或保留孤立区域。
-- Fill between slices：当相邻切片轮廓可靠时填充中间切片。
+还可以使用“撤销”“重做”和“上一层”“下一层”。“剪刀”“清理零碎区域”“层间补全”
+位于“辅助工具”折叠区域。不要新增其它 segment；本项目只保存一个下颌髁突类别。
 
-工具的细节以你安装的 3D Slicer 版本为准。本项目不替换这些工具。
+第一次进入步骤 2 时会显示新手提示：黄色圆圈是画笔范围，按住鼠标左键在髁突区域
+涂抹，涂错后点击“擦除”。点击“知道了”后不会重复显示。
 
 ## 7. 如何找到下颌髁突
 
@@ -97,7 +95,7 @@ python scripts/dicom_to_nifti.py C:/private/one_case --case-id case_001
 
 发现涂到了关节盘、关节窝、颞骨或背景时：
 
-1. 点击 Erase。
+1. 点击“擦除”。
 2. 调整半径。
 3. 沿错误区域擦除。
 4. 切换到另外两个视图，确认没有留下小岛。
@@ -121,7 +119,8 @@ python scripts/dicom_to_nifti.py C:/private/one_case --case-id case_001
 
 ## 10. 打开 3D 显示
 
-点击“Show 3D”。Slicer 会根据当前 segment 生成闭合表面。旋转表面检查：
+完成逐层标注后点击“标完了，下一步：检查”，再点击“显示三维髁突”。模块会根据
+当前标注生成闭合表面。旋转表面检查：
 
 - 是否只有髁突；
 - 表面是否有明显大洞；
@@ -133,7 +132,7 @@ python scripts/dicom_to_nifti.py C:/private/one_case --case-id case_001
 
 ## 11. 保存 Mask
 
-点击“保存髁突 Mask”。模块在保存前会检查：
+点击“确认无误，下一步保存”，再点击“保存本例标注”。模块在保存前会检查：
 
 - MRI 与 mask 的 shape 相同；
 - spacing、origin、direction 相同；
@@ -143,9 +142,8 @@ python scripts/dicom_to_nifti.py C:/private/one_case --case-id case_001
 - physical volume（mm³）；
 - connected components 过多时给 warning。
 
-模块不会自动把错误值改成 0 或 1，也不会自动删除小块。出现 FAIL 时回到
-Segment Editor 修正后重新检查。出现 warning 时必须由医生回看，warning 本身
-不会强行修改 mask。
+模块不会自动把错误值改成 0 或 1，也不会自动删除小块。出现问题时点击“返回继续
+修改”，在工作台内修正后重新检查；提示只反映技术问题，不判断医学正确性。
 
 推荐输出：
 

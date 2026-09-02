@@ -66,9 +66,10 @@ $env:nnUNet_results = "C:/code/TMJ-Condyle-3D/workspace/nnUNet_results"
    先根据 inspect_dicom.py 返回的匿名 series_index 选择目标序列；也可以在私有
    本地命令中传入 SeriesInstanceUID。项目不会按文件名猜顺序。
 3. 在 3D Slicer 中安装本项目的 slicer/TMJCondyleAnnotator 模块。
-4. 用 TMJ Condyle Annotator 创建唯一 segment，点击开始标注，实际使用原生
-   Segment Editor 逐层画髁突。
-5. Show 3D 检查后保存 mask。保存动作会拒绝空 mask、非 0/1 标签和 geometry 不一致。
+4. 在“下颌髁突三维标注”工作台中点击“下一步：开始标注”，使用中文“画笔”和
+   “擦除”逐层画髁突；整个流程留在本项目页面，不切换到原生 Segment Editor。
+5. 点击“标完了，下一步：检查”，查看三视图和 3D 髁突，技术检查通过后保存 mask。
+   保存动作会拒绝空 mask、非 0/1 标签和 geometry 不一致。
 6. 将病例状态保持为 ANNOTATED 或 VERIFIED，再运行数据集 QC。
 
 详细步骤见 docs/ANNOTATION_GUIDE_zh-CN.md 和 docs/DATASET_GUIDE_zh-CN.md。
@@ -178,8 +179,8 @@ python scripts/export_slicer_model.py
         fold_4/checkpoint_final.pth
 
 在 3D Slicer 安装 SlicerNNUnet，设置模型路径，选择 MRI，Apply，检查生成的
-Mandibular Condyle segmentation，再在 Segment Editor 中 Show 3D。详细说明见
-docs/SLICER_GUIDE_zh-CN.md。
+Mandibular Condyle segmentation。人工标注仍通过本项目的“下颌髁突三维标注”工作台
+查看三维结果；详细说明见 docs/SLICER_GUIDE_zh-CN.md。
 
 ## 参考项目与归属
 
@@ -196,7 +197,8 @@ docs/SLICER_GUIDE_zh-CN.md。
 - 3D Slicer 部署使用
   [KitwareMedical/SlicerNNUnet](https://github.com/KitwareMedical/SlicerNNUnet)，
   其仓库许可证为 BSD 3-Clause；SlicerNNUnet 需要保留官方 nnU-Net 权重目录结构。
-- 可视化和标注基于 [3D Slicer](https://www.slicer.org/) 原生 Segment Editor。
+- 可视化和标注基于 [3D Slicer](https://www.slicer.org/) 的视图与嵌入式 Segment
+  Editor 编辑引擎；用户操作集中在本项目中文工作台内。
 
 参考仓库的临时 clone 位于 references/，并被 .gitignore 忽略。
 
