@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tmj-condyle-3d"
+version = "0.1.0"
+description = "A reproducible one-class mandibular-condyle MRI segmentation workflow."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = { file = "LICENSE" }
+authors = [{ name = "TMJ-Condyle-3D contributors" }]
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "SimpleITK>=2.2.1",
+  "nibabel>=5.0",
+  "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+nnunet = ["nnunetv2==2.8.1"]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+include = ["tmj_condyle*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

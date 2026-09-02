@@ -1,0 +1,49 @@
+# Python and local tooling
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.env
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary third-party source checkouts. These are for local reading only.
+/references/
+
+# Patient/medical data and all generated experiment outputs.
+# Keep these patterns broad on purpose: do not commit clinical data by accident.
+/workspace/**
+/data/**
+/raw/**
+/DICOM/**
+/NIfTI/**
+/labels/**
+/predictions/**
+/checkpoints/**
+*.dcm
+*.DCM
+*.nii
+*.nii.gz
+*.nrrd
+*.mha
+*.mhd
+*.raw
+*.h5
+*.hdf5
+*.pth
+*.pt
+*.ckpt
+*.npz
+
+# Local reports may include derived patient data or model outputs.
+*.log
