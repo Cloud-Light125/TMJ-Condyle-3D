@@ -90,16 +90,8 @@ def _write_lock(path: Path) -> None:
     )
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="One-command TMJ-Condyle-3D environment/QC check.")
-    parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
-    parser.add_argument("--write-lock", action="store_true")
-    args = parser.parse_args()
-
-    print("TMJ-Condyle-3D environment check")
-    print(f"OS: {platform.platform()}")
-    print(f"Python: {sys.version.split()[0]} ({sys.executable})")
-    print(f"Project: {PROJECT_ROOT}")
+def collect_environment_report(manifest: Path = MANIFEST_PATH) -> dict[str, object]:
+    """Collect one machine-readable report for both CLI and the Slicer GUI."""
 
     numpy_version, _ = _import_version("numpy")
     sitk_version, _ = _import_version("SimpleITK", "SimpleITK")
@@ -107,75 +99,123 @@ def main() -> int:
     scipy_version, _ = _import_version("scipy")
     torch_version, torch = _import_version("torch")
     nnunet_version, _ = _import_version("nnunetv2", "nnunetv2")
-    print(f"NumPy: {numpy_version}")
-    print(f"SimpleITK: {sitk_version}")
-    print(f"nibabel: {nibabel_version}")
-    print(f"SciPy: {scipy_version}")
-    print(f"PyTorch: {torch_version}")
-    print(f"nnUNet v2: {nnunet_version}")
-    print(f"nnUNetv2_plan_and_preprocess: {_entrypoint('nnUNetv2_plan_and_preprocess') or 'NOT FOUND'}")
-    print(f"nnUNetv2_train: {_entrypoint('nnUNetv2_train') or 'NOT FOUND'}")
-    print(f"nnUNetv2_predict: {_entrypoint('nnUNetv2_predict') or 'NOT FOUND'}")
+    entrypoints = {
+        name: _entrypoint(name)
+        for name in (
+            "nnUNetv2_plan_and_preprocess",
+            "nnUNetv2_train",
+            "nnUNetv2_predict",
+        )
+    }
     cuda = _cuda_report(torch)
-    print(f"CUDA: {json.dumps(cuda, ensure_ascii=False)}")
-
-    for name, path in (
-        ("images", NIFTI_DIR),
-        ("labels", LABELS_DIR),
-        ("nnUNet_raw", NNUNET_RAW_DIR),
-        ("nnUNet_preprocessed", NNUNET_PREPROCESSED_DIR),
-        ("nnUNet_results", NNUNET_RESULTS_DIR),
-        ("reports", REPORTS_DIR),
-    ):
-        print(f"{name} directory: {path} ({'EXISTS' if path.exists() else 'MISSING'})")
     image_count = len(nifti_files(NIFTI_DIR))
     label_count = len(nifti_files(LABELS_DIR))
-    print(f"Number of images: {image_count}")
-    print(f"Number of labels: {label_count}")
 
     validation_rows, validation_ok = ([], False)
-    if sitk_version != "NOT INSTALLED" and args.manifest.exists():
+    if sitk_version != "NOT INSTALLED" and manifest.exists():
         validation_rows, validation_ok = validate_manifest_dataset(
-            manifest_path=args.manifest,
+            manifest_path=manifest,
             images_dir=NIFTI_DIR,
             labels_dir=LABELS_DIR,
             report_dir=REPORTS_DIR,
         )
     ready_cases = [
-        row for row in validation_rows
-        if row["status"] == "PASS" and row.get("annotation_status") in {"ANNOTATED", "VERIFIED"}
+        row
+        for row in validation_rows
+        if row["status"] == "PASS"
+        and row.get("annotation_status") in {"ANNOTATED", "VERIFIED"}
     ]
     groups = {str(row.get("group_id") or row["case_id"]) for row in ready_cases}
-    missing_labels = [
-        row.get("case_id")
-        for row in validation_rows
-        if "missing label" in str(row.get("errors", ""))
-    ]
-    geometry_errors = [
-        row.get("case_id")
-        for row in validation_rows
-        if "geometry" in str(row.get("errors", "")).lower()
-    ]
-    print(f"Ready cases: {len(ready_cases)}")
-    print(f"Missing labels: {missing_labels or 'none'}")
-    print(f"Geometry errors: {geometry_errors or 'none'}")
-    annotation_ready = image_count > 0 and sitk_version != "NOT INSTALLED"
     env_ready = (
         sitk_version != "NOT INSTALLED"
         and scipy_version != "NOT INSTALLED"
         and torch_version != "NOT INSTALLED"
         and nnunet_version != "NOT INSTALLED"
+        and entrypoints["nnUNetv2_plan_and_preprocess"] is not None
+        and entrypoints["nnUNetv2_train"] is not None
+        and entrypoints["nnUNetv2_predict"] is not None
     )
     gpu_ready = cuda.get("status") == "PASS"
-    training_ready = validation_ok and len(ready_cases) >= 5 and len(groups) >= 5 and env_ready and gpu_ready
-    print("READY FOR ANNOTATION" if annotation_ready else "NOT READY FOR ANNOTATION")
-    if training_ready:
-        print("READY FOR TRAINING")
-    elif env_ready and not gpu_ready:
-        print("FULL TRAINING BLOCKED BY GPU")
-        print("NOT READY")
+    data_ready = validation_ok and len(ready_cases) >= 5 and len(groups) >= 5
+    return {
+        "platform": platform.platform(),
+        "python": {"version": sys.version.split()[0], "executable": sys.executable},
+        "python_ready": True,
+        "packages": {
+            "numpy": numpy_version,
+            "SimpleITK": sitk_version,
+            "nibabel": nibabel_version,
+            "scipy": scipy_version,
+            "torch": torch_version,
+            "nnunetv2": nnunet_version,
+        },
+        "entrypoints": entrypoints,
+        "cuda": cuda,
+        "directories": {
+            "images": str(NIFTI_DIR),
+            "labels": str(LABELS_DIR),
+            "nnUNet_raw": str(NNUNET_RAW_DIR),
+            "nnUNet_preprocessed": str(NNUNET_PREPROCESSED_DIR),
+            "nnUNet_results": str(NNUNET_RESULTS_DIR),
+            "reports": str(REPORTS_DIR),
+        },
+        "image_count": image_count,
+        "label_count": label_count,
+        "validated_case_count": len(validation_rows),
+        "annotated_case_count": len(ready_cases),
+        "group_count": len(groups),
+        "validation_ok": validation_ok,
+        "data_ready": data_ready,
+        "nnunet_ready": env_ready,
+        "gpu_ready": gpu_ready,
+        "formal_training_ready": data_ready and env_ready and gpu_ready,
+        "missing_labels": [
+            row.get("case_id")
+            for row in validation_rows
+            if "missing label" in str(row.get("errors", ""))
+        ],
+        "geometry_errors": [
+            row.get("case_id")
+            for row in validation_rows
+            if "geometry" in str(row.get("errors", "")).lower()
+        ],
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="One-command TMJ-Condyle-3D environment/QC check.")
+    parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
+    parser.add_argument("--write-lock", action="store_true")
+    parser.add_argument("--json", action="store_true", help="Print a machine-readable JSON report for the GUI.")
+    args = parser.parse_args()
+    report = collect_environment_report(args.manifest)
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False))
     else:
-        print("NOT READY")
+        print("TMJ-Condyle-3D environment check")
+        print(f"OS: {report['platform']}")
+        print(f"Python: {report['python']['version']} ({report['python']['executable']})")
+        for name, version in report["packages"].items():
+            print(f"{name}: {version}")
+        for name, path in report["entrypoints"].items():
+            print(f"{name}: {path or 'NOT FOUND'}")
+        print(f"CUDA: {json.dumps(report['cuda'], ensure_ascii=False)}")
+        for name, path in report["directories"].items():
+            print(f"{name} directory: {path} ({'EXISTS' if Path(path).exists() else 'MISSING'})")
+        print(f"Number of images: {report['image_count']}")
+        print(f"Number of labels: {report['label_count']}")
+        print(f"Ready cases: {report['annotated_case_count']}")
+        print(f"Missing labels: {report['missing_labels'] or 'none'}")
+        print(f"Geometry errors: {report['geometry_errors'] or 'none'}")
+        print("READY FOR ANNOTATION" if report["image_count"] > 0 and report["packages"]["SimpleITK"] != "NOT INSTALLED" else "NOT READY FOR ANNOTATION")
+        if report["formal_training_ready"]:
+            print("READY FOR TRAINING")
+        elif report["nnunet_ready"] and not report["gpu_ready"]:
+            print("FULL TRAINING BLOCKED BY GPU")
+            print("NOT READY")
+        else:
+            print("NOT READY")
 
     if args.write_lock:
         lock = PROJECT_ROOT / "requirements-lock.txt"

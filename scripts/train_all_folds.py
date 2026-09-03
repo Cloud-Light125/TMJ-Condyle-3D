@@ -13,6 +13,7 @@ from _bootstrap import PROJECT_ROOT
 
 from tmj_condyle.config import (
     CONFIGURATION,
+    DATASET_ID,
     DATASET_NAME,
     NNUNET_PREPROCESSED_DIR,
     NNUNET_RAW_DIR,
@@ -35,6 +36,7 @@ def _command(executable: str) -> list[str]:
         return [found]
     modules = {
         "nnUNetv2_train": "nnunetv2.run.run_training",
+        "nnUNetv2_plan_and_preprocess": "nnunetv2.experiment_planning.plan_and_preprocess_entrypoints",
     }
     module = modules.get(executable)
     if module is None:
@@ -123,6 +125,11 @@ def main() -> int:
     parser.add_argument("--plans", default="nnUNetPlans")
     parser.add_argument("--resume", action="store_true", help="Continue incomplete folds with --c.")
     parser.add_argument("--no-skip-completed", action="store_true")
+    parser.add_argument(
+        "--plan",
+        action="store_true",
+        help="Run the official nnUNetv2_plan_and_preprocess before the folds.",
+    )
     args = parser.parse_args()
 
     dataset_dir = NNUNET_RAW_DIR / args.dataset
@@ -148,6 +155,26 @@ def main() -> int:
             "nnUNet_results": str(NNUNET_RESULTS_DIR.resolve()),
         }
     )
+    if args.plan:
+        print("TMJ_PLAN_START", flush=True)
+        planner = _command("nnUNetv2_plan_and_preprocess")
+        dataset_id = dataset_dir.name.removeprefix("Dataset")
+        if not dataset_id.isdigit():
+            dataset_id = str(DATASET_ID)
+        plan_command = [
+            *planner,
+            "-d",
+            dataset_id,
+            "--verify_dataset_integrity",
+            "-c",
+            args.configuration,
+        ]
+        print("Running:", " ".join(plan_command), flush=True)
+        planned = subprocess.run(plan_command, cwd=PROJECT_ROOT, env=env, check=False)
+        if planned.returncode != 0:
+            print(f"TMJ_PLAN_FAILED {planned.returncode}", flush=True)
+            return planned.returncode or 2
+        print("TMJ_PLAN_COMPLETE", flush=True)
     executable = _command("nnUNetv2_train")
     records: list[dict[str, object]] = []
     for fold in folds:
@@ -162,8 +189,10 @@ def main() -> int:
                 "checkpoints": _checkpoint_state(fold_dir),
             }
             records.append(record)
-            print(f"fold {fold}: already complete, skipped")
+            print(f"fold {fold}: already complete, skipped", flush=True)
+            print(f"TMJ_FOLD_COMPLETE {fold}", flush=True)
             continue
+        print(f"TMJ_FOLD_START {fold}", flush=True)
         command = [
             *executable,
             args.dataset,
@@ -177,9 +206,16 @@ def main() -> int:
             "-device",
             args.device,
         ]
-        if args.resume:
+        resumable_checkpoint = any(
+            (fold_dir / name).exists()
+            for name in ("checkpoint_latest.pth", "checkpoint_best.pth")
+        )
+        if args.resume and resumable_checkpoint:
             command.append("--c")
-        print("Running:", " ".join(command))
+            print(f"fold {fold}: resuming from existing checkpoint", flush=True)
+        elif args.resume:
+            print(f"fold {fold}: no checkpoint found; starting this incomplete fold", flush=True)
+        print("Running:", " ".join(command), flush=True)
         start = time.perf_counter()
         completed = subprocess.run(command, cwd=PROJECT_ROOT, env=env, check=False)
         elapsed = time.perf_counter() - start
@@ -194,8 +230,10 @@ def main() -> int:
         record["checkpoints"] = _checkpoint_state(fold_dir)
         _write_summary(records, REPORTS_DIR / "training_summary.md", device_info)
         if completed.returncode != 0:
-            print(f"fold {fold} failed; later folds were not started")
+            print(f"TMJ_FOLD_FAILED {fold} {completed.returncode}", flush=True)
+            print(f"fold {fold} failed; later folds were not started", flush=True)
             return completed.returncode or 2
+        print(f"TMJ_FOLD_COMPLETE {fold}", flush=True)
     _write_summary(records, REPORTS_DIR / "training_summary.md", device_info)
     return 0 if all(str(record["status"]).startswith(("PASS", "SKIPPED")) for record in records) else 2
 

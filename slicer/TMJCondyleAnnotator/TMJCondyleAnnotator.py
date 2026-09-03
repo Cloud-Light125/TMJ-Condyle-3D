@@ -9,7 +9,13 @@ parameter node, the MRML scene association, and slice-view observations.
 from __future__ import annotations
 
 import csv
+import datetime
+import json
+import os
 import re
+import shutil
+import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -22,6 +28,53 @@ from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModuleTest,
     ScriptedLoadableModuleWidget,
 )
+
+
+# The module is commonly loaded through Slicer's additional-module-path.  Add
+# the project root explicitly so the GUI and the command-line workflow share
+# the same tested experiment service layer in both launch modes.
+_PROJECT_ROOT_FOR_IMPORT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT_FOR_IMPORT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT_FOR_IMPORT))
+
+from tmj_condyle.experiment import (  # noqa: E402
+    FOLDS,
+    assess_training_readiness,
+    case_counts,
+    completed_folds,
+    count_guidance,
+    create_experiment_run,
+    dataset_build_command,
+    dataset_validation_command,
+    detect_fold_states,
+    environment_command,
+    environment_display,
+    evaluation_command,
+    export_experiment_results,
+    finalize_experiment_run,
+    fold_results_directory,
+    format_metric,
+    has_evaluation_results,
+    home_next_step,
+    list_experiment_runs,
+    load_case_inventory,
+    oof_command,
+    parse_environment_json,
+    parse_training_line,
+    prediction_command,
+    prediction_result_ready,
+    project_python_executable,
+    read_experiment_record,
+    read_metrics_csv,
+    read_metrics_summary,
+    read_splits,
+    read_validation_csv,
+    script_command,
+    summarize_metrics_by_fold,
+    training_command,
+    user_training_message,
+)
+from tmj_condyle.data.manifest import read_manifest  # noqa: E402
 
 
 CASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -59,16 +112,37 @@ ORIENTATIONS = {
     2: "Axial",
 }
 
+MAIN_NAVIGATION = (
+    ("home", "首页"),
+    ("cases", "病例与标注"),
+    ("dataset", "训练数据"),
+    ("training", "模型训练"),
+    ("results", "实验结果"),
+    ("prediction", "自动分割"),
+    ("settings", "设置"),
+)
+PAGE_HOME = 0
+PAGE_CASE_IMPORT = 1
+PAGE_CASE_ANNOTATION = 2
+PAGE_CASE_CHECK = 3
+PAGE_CASE_SAVE = 4
+PAGE_DATASET = 5
+PAGE_TRAINING = 6
+PAGE_RESULTS = 7
+PAGE_PREDICTION = 8
+PAGE_SETTINGS = 9
+
 
 class TMJCondyleAnnotator(ScriptedLoadableModule):
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent.title = "下颌髁突三维标注"
+        self.parent.title = "下颌髁突三维分割实验平台"
         self.parent.categories = ["Segmentation"]
         self.parent.contributors = ["TMJ-Condyle-3D"]
         self.parent.helpText = (
-            "面向牙医和医学生的下颌髁突人工标注工作台。"
-            "导入、标注、检查和保存都在同一页面完成。"
+            "面向牙科医学生的下颌髁突 MRI 三维分割实验平台。"
+            "从病例导入、人工标注到 nnU-Net 训练、评价和新病例自动分割，"
+            "所有步骤都在中文工作台内完成。"
         )
         self.parent.acknowledgementText = (
             "This module is part of the TMJ-Condyle-3D teaching/research workflow."
@@ -130,6 +204,38 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self._surfacePointCount = 0
         self._surfaceCellCount = 0
 
+        # Experiment-platform state.  The annotation editor state above is
+        # intentionally kept separate so the mature editor remains stable.
+        self._mainPage = "home"
+        self._process = None
+        self._processKind = ""
+        self._processOutput = ""
+        self._processLogPath = None
+        self._processStartedAt = None
+        self._processStopRequested = False
+        self._environmentReport = None
+        self._validationRows = []
+        self._validationPassed = False
+        self._datasetPrepared = False
+        self._preprocessingPrepared = False
+        self._trainingFoldEvents = {}
+        self._activeTrainingFold = None
+        self._currentRunDir = None
+        self._resultRunDir = None
+        self._resultRows = []
+        self._resultSummary = {}
+        self._selectedResultCase = None
+        self._predictionInputPath = None
+        self._predictionOutputPath = None
+        self._predictionImageNode = None
+        self._predictionLabelNode = None
+        self._predictionSegmentationNode = None
+        self._resultImageNode = None
+        self._resultGroundTruthNode = None
+        self._resultPredictionNode = None
+        self._resultCompareSegmentationNode = None
+        self._taskTimer = None
+
         self._simpleMode = False
         self._simpleModeTargets = []
         self._previousLayout = None
@@ -149,7 +255,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         # panels just after a scripted module is constructed.  Re-apply the
         # temporary simple-mode filter once the main window is settled.
         qt.QTimer.singleShot(800, lambda: self._setSimpleMode(True))
-        self._setStatusMessage("欢迎使用。点击“开始新的标注”选择病例。", "info")
+        self._setStatusMessage("欢迎使用。先导入病例并标注下颌髁突。", "info")
         self._syncUi()
 
     # ------------------------------------------------------------------
@@ -168,7 +274,8 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         }
         QFrame#headerCard, QFrame#stepCard, QFrame#caseCard,
         QFrame#contentCard, QFrame#hintCard, QFrame#statusCard,
-        QFrame#summaryCard, QLabel#summaryCard {
+        QFrame#summaryCard, QLabel#summaryCard, QFrame#navCard,
+        QFrame#statCard, QFrame#foldCard, QFrame#metricCard {
           background: #ffffff;
           border: 1px solid #e1eaf0;
           border-radius: 14px;
@@ -235,6 +342,53 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
           color: #526777;
           font-size: 13px;
           line-height: 1.5;
+        }
+        QLabel#homeNextStep {
+          color: #16839a;
+          background: #eaf6f8;
+          border-radius: 10px;
+          padding: 10px 12px;
+          font-size: 13px;
+          font-weight: 600;
+        }
+        QLabel#statCaption {
+          color: #718391;
+          font-size: 11px;
+        }
+        QLabel#statValue {
+          color: #163b57;
+          font-size: 19px;
+          font-weight: 600;
+        }
+        QLabel#metricValue {
+          color: #163b57;
+          font-size: 20px;
+          font-weight: 600;
+        }
+        QLabel#metricCaption {
+          color: #718391;
+          font-size: 11px;
+        }
+        QPushButton#navButton {
+          background: transparent;
+          color: #526777;
+          border: none;
+          border-radius: 8px;
+          min-height: 34px;
+          padding: 0 9px;
+          font-size: 12px;
+          font-weight: 600;
+        }
+        QPushButton#navButton:hover {
+          background: #eef6fb;
+          color: #16839a;
+        }
+        QPushButton#navButton[active="true"] {
+          background: #16839a;
+          color: #ffffff;
+        }
+        QLabel#statusMessage, QLabel#resultMessage, QLabel#infoMessage {
+          min-height: 18px;
         }
         QLabel#homeProgress {
           color: #28546a;
@@ -419,6 +573,41 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
           color: #5d6b75;
           font-size: 11px;
         }
+        QPlainTextEdit#taskLog {
+          background: #17232d;
+          color: #d5e6ec;
+          border: none;
+          border-radius: 9px;
+          font-size: 11px;
+        }
+        QProgressBar#taskProgress {
+          background: #eef2f5;
+          border: none;
+          border-radius: 5px;
+          height: 9px;
+          text-align: center;
+        }
+        QProgressBar#taskProgress::chunk {
+          background: #16839a;
+          border-radius: 5px;
+        }
+        QTableWidget, QListWidget {
+          background: #ffffff;
+          border: 1px solid #e1eaf0;
+          border-radius: 9px;
+          alternate-background-color: #f7fafb;
+        }
+        QTableWidget::item:selected, QListWidget::item:selected {
+          background: #dff1f3;
+          color: #163b57;
+        }
+        QHeaderView::section {
+          background: #eef6fb;
+          color: #526777;
+          border: none;
+          padding: 6px;
+          font-weight: 600;
+        }
         """
 
     def _buildUi(self):
@@ -447,6 +636,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         mainLayout.setSpacing(10)
 
         self._buildHeader(mainLayout)
+        self._buildMainNavigation(mainLayout)
         self._buildStepBar(mainLayout)
         self._buildCaseCard(mainLayout)
 
@@ -457,6 +647,11 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.pageStack.addWidget(self._buildAnnotationPage())
         self.pageStack.addWidget(self._buildCheckPage())
         self.pageStack.addWidget(self._buildSavePage())
+        self.pageStack.addWidget(self._buildDatasetPage())
+        self.pageStack.addWidget(self._buildTrainingPage())
+        self.pageStack.addWidget(self._buildResultsPage())
+        self.pageStack.addWidget(self._buildPredictionPage())
+        self.pageStack.addWidget(self._buildSettingsPage())
         self.pageStack.setCurrentIndex(0)
         mainLayout.addWidget(self.pageStack)
 
@@ -485,15 +680,33 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.advancedWidget.setVisible(False)
         mainLayout.addWidget(self.advancedWidget)
 
+    def _buildMainNavigation(self, mainLayout):
+        card = self._card("navCard")
+        row = qt.QHBoxLayout(card)
+        row.setContentsMargins(7, 5, 7, 5)
+        row.setSpacing(2)
+        self.navigationButtons = {}
+        for key, label in MAIN_NAVIGATION:
+            button = qt.QPushButton(label)
+            button.setObjectName("navButton")
+            button.setProperty("active", key == "home")
+            button.clicked.connect(
+                lambda checked=False, page=key: self._showMainPage(page)
+            )
+            self.navigationButtons[key] = button
+            row.addWidget(button, 1)
+        self.navigationCard = card
+        mainLayout.addWidget(card)
+
     def _buildHeader(self, mainLayout):
         card = self._card("headerCard")
         row = qt.QHBoxLayout(card)
         row.setContentsMargins(18, 14, 14, 14)
         brand = qt.QVBoxLayout()
-        self.titleLabel = qt.QLabel("下颌髁突三维标注")
+        self.titleLabel = qt.QLabel("下颌髁突三维分割实验平台")
         self.titleLabel.setObjectName("mainTitle")
         brand.addWidget(self.titleLabel)
-        self.subtitleLabel = qt.QLabel("核磁标注与三维查看")
+        self.subtitleLabel = qt.QLabel("TMJ MRI · 标注、训练、评估与三维分割")
         self.subtitleLabel.setObjectName("subtitleLabel")
         brand.addWidget(self.subtitleLabel)
         row.addLayout(brand, 1)
@@ -518,7 +731,8 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         mainLayout.addWidget(card)
 
     def _buildStepBar(self, mainLayout):
-        row = qt.QHBoxLayout()
+        container = qt.QWidget()
+        row = qt.QHBoxLayout(container)
         row.setSpacing(5)
         self.stepWidgets = []
         self.stepNumberLabels = []
@@ -546,7 +760,8 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self.stepNumberLabels.append(numberLabel)
             self.stepStatusLabels.append(statusLabel)
             row.addWidget(card, 1)
-        mainLayout.addLayout(row)
+        self.stepBarWidget = container
+        mainLayout.addWidget(container)
 
     def _buildCaseCard(self, mainLayout):
         card = self._card("caseCard")
@@ -573,6 +788,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             column.addWidget(value)
             row.addLayout(column, 1)
         layout.addLayout(row)
+        self.caseSummaryCard = card
         mainLayout.addWidget(card)
 
     def _buildHomePage(self):
@@ -582,23 +798,23 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         welcome = qt.QLabel("欢迎使用")
         welcome.setObjectName("pageEyebrow")
         layout.addWidget(welcome)
-        title = qt.QLabel("下颌髁突三维标注")
+        title = qt.QLabel("下颌髁突三维分割实验平台")
         title.setObjectName("pageTitle")
         layout.addWidget(title)
         subtitle = qt.QLabel(
-            "给核磁中的下颌髁突做标记，为后续自动分割训练准备数据。"
+            "TMJ MRI · 标注、训练、评估与三维分割"
         )
         subtitle.setObjectName("mutedLabel")
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
 
-        lead = qt.QLabel("你现在做的事情很简单：")
+        lead = qt.QLabel("从人工标注到自动分割，一站完成实验：")
         lead.setObjectName("homeLead")
         layout.addWidget(lead)
         purpose = qt.QLabel(
-            "先告诉电脑哪些地方是下颌髁突。\n"
-            "等标好一批病例后，这些标注会用来训练电脑。\n"
-            "训练完成后，以后的新核磁就可以自动把髁突分出来，并显示成三维模型。"
+            "先导入核磁并标出下颌髁突，再准备训练数据。\n"
+            "系统会调用真实的 nnU-Net v2 3d_fullres 和 grouped 5-fold 流程。\n"
+            "训练完成后，可以查看 Dice / IoU / HD95，并用新核磁自动分割。"
         )
         purpose.setObjectName("homePurpose")
         purpose.setWordWrap(True)
@@ -609,35 +825,70 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.homeProgressLabel.setWordWrap(True)
         layout.addWidget(self.homeProgressLabel)
 
+        self.homeNextStepLabel = qt.QLabel()
+        self.homeNextStepLabel.setObjectName("homeNextStep")
+        self.homeNextStepLabel.setWordWrap(True)
+        layout.addWidget(self.homeNextStepLabel)
+
+        statsCard = self._card("statCard")
+        statsLayout = qt.QHBoxLayout(statsCard)
+        statsLayout.setContentsMargins(12, 10, 12, 10)
+        self.homeStatLabels = {}
+        for key, caption in (
+            ("total", "病例总数"),
+            ("annotated", "已标注"),
+            ("trainable", "可用于训练"),
+            ("training", "训练状态"),
+            ("results", "实验结果"),
+            ("model", "训练模型"),
+        ):
+            column = qt.QVBoxLayout()
+            captionLabel = qt.QLabel(caption)
+            captionLabel.setObjectName("statCaption")
+            valueLabel = qt.QLabel("—")
+            valueLabel.setObjectName("statValue")
+            column.addWidget(captionLabel)
+            column.addWidget(valueLabel)
+            statsLayout.addLayout(column, 1)
+            self.homeStatLabels[key] = valueLabel
+        layout.addWidget(statsCard)
+
         cards = qt.QGridLayout()
         cards.setHorizontalSpacing(10)
         cards.setVerticalSpacing(10)
-        self.homeStartButton = self._homeCardButton("开始新的标注")
-        self.homeStartButton.clicked.connect(self._startNewAnnotationFromHome)
+        self.homeStartButton = self._homeCardButton("继续标注")
+        self.homeStartButton.clicked.connect(self._continueLastAnnotation)
         cards.addWidget(self.homeStartButton, 0, 0)
-        self.homeContinueButton = self._homeCardButton("继续上次标注")
-        self.homeContinueButton.clicked.connect(self._continueLastAnnotation)
+        self.homeContinueButton = self._homeCardButton("导入病例")
+        self.homeContinueButton.clicked.connect(self._startNewAnnotationFromHome)
         cards.addWidget(self.homeContinueButton, 0, 1)
-        self.homeProgressButton = self._homeCardButton("查看标注进度")
-        self.homeProgressButton.clicked.connect(self._showProgressDialog)
+        self.homeProgressButton = self._homeCardButton("病例与标注")
+        self.homeProgressButton.clicked.connect(lambda checked=False: self._showMainPage("cases"))
         cards.addWidget(self.homeProgressButton, 1, 0)
-        self.homeAnnotatedButton = self._homeCardButton("查看已标注病例")
-        self.homeAnnotatedButton.clicked.connect(
-            lambda checked=False: self._showProgressDialog(onlyCompleted=True)
-        )
+        self.homeAnnotatedButton = self._homeCardButton("准备训练")
+        self.homeAnnotatedButton.clicked.connect(lambda checked=False: self._showMainPage("dataset"))
         cards.addWidget(self.homeAnnotatedButton, 1, 1)
-        self.homeHelpButton = self._homeCardButton("使用说明")
+        self.homeTrainingButton = self._homeCardButton("开始实验")
+        self.homeTrainingButton.clicked.connect(lambda checked=False: self._showMainPage("training"))
+        cards.addWidget(self.homeTrainingButton, 2, 0)
+        self.homeResultsButton = self._homeCardButton("查看实验结果")
+        self.homeResultsButton.clicked.connect(lambda checked=False: self._showMainPage("results"))
+        cards.addWidget(self.homeResultsButton, 2, 1)
+        self.homePredictButton = self._homeCardButton("自动分割新病例")
+        self.homePredictButton.clicked.connect(lambda checked=False: self._showMainPage("prediction"))
+        cards.addWidget(self.homePredictButton, 3, 0)
+        self.homeHelpButton = self._homeCardButton("怎么做实验？")
         self.homeHelpButton.clicked.connect(self._showUsageGuide)
-        cards.addWidget(self.homeHelpButton, 2, 0, 1, 2)
+        cards.addWidget(self.homeHelpButton, 3, 1)
         layout.addLayout(cards)
 
         processCard = self._card("hintCard")
         processLayout = qt.QVBoxLayout(processCard)
         processLayout.setContentsMargins(14, 12, 14, 12)
-        processTitle = qt.QLabel("使用流程")
+        processTitle = qt.QLabel("完整实验流程")
         processTitle.setObjectName("sectionTitle")
         processLayout.addWidget(processTitle)
-        process = qt.QLabel("① 导入核磁　② 标出髁突　③ 检查三维结果　④ 保存")
+        process = qt.QLabel("① 准备病例　→　② 标注髁突　→　③ 训练模型　→　④ 查看结果　→　⑤ 自动分割新病例")
         process.setObjectName("hintLabel")
         process.setWordWrap(True)
         processLayout.addWidget(process)
@@ -672,6 +923,27 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         )
         self.importLoadedRow.addWidget(self.loadedVolumeSelector, 1)
         layout.addLayout(self.importLoadedRow)
+
+        caseTitle = qt.QLabel("病例列表")
+        caseTitle.setObjectName("sectionTitle")
+        layout.addWidget(caseTitle)
+        self.caseListWidget = qt.QListWidget()
+        self.caseListWidget.setAlternatingRowColors(True)
+        self.caseListWidget.setMinimumHeight(120)
+        self.caseListWidget.currentRowChanged.connect(self._onCaseListRowChanged)
+        layout.addWidget(self.caseListWidget)
+
+        caseActionRow = qt.QHBoxLayout()
+        self.caseContinueButton = self._primaryButton("继续标注")
+        self.caseContinueButton.clicked.connect(self._continueSelectedCase)
+        caseActionRow.addWidget(self.caseContinueButton)
+        self.caseViewButton = self._secondaryButton("查看标注")
+        self.caseViewButton.clicked.connect(self._viewSelectedCase)
+        caseActionRow.addWidget(self.caseViewButton)
+        self.caseReeditButton = self._secondaryButton("重新编辑")
+        self.caseReeditButton.clicked.connect(self._reeditSelectedCase)
+        caseActionRow.addWidget(self.caseReeditButton)
+        layout.addLayout(caseActionRow)
 
         buttonRow = qt.QHBoxLayout()
         self.loadButton = self._primaryButton("选择核磁文件")
@@ -973,6 +1245,339 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         layout.addStretch(1)
         return page
 
+    def _buildDatasetPage(self):
+        page = self._card("contentCard")
+        layout = qt.QVBoxLayout(page)
+        layout.setContentsMargins(18, 18, 18, 18)
+        self._addPageHeader(
+            layout,
+            "实验准备",
+            "训练数据",
+            "先检查全部病例，再把通过检查的真实人工标注整理成训练数据。技术文件会由系统自动生成。",
+        )
+
+        self.datasetSummaryLabel = qt.QLabel()
+        self.datasetSummaryLabel.setObjectName("resultMessage")
+        self.datasetSummaryLabel.setWordWrap(True)
+        layout.addWidget(self.datasetSummaryLabel)
+        self.datasetGuidanceLabel = qt.QLabel()
+        self.datasetGuidanceLabel.setObjectName("infoMessage")
+        self.datasetGuidanceLabel.setWordWrap(True)
+        layout.addWidget(self.datasetGuidanceLabel)
+
+        stepCard = self._card("hintCard")
+        stepLayout = qt.QVBoxLayout(stepCard)
+        stepLayout.setContentsMargins(13, 11, 13, 11)
+        stepTitle = qt.QLabel("准备进度")
+        stepTitle.setObjectName("sectionTitle")
+        stepLayout.addWidget(stepTitle)
+        self.datasetStepLabels = []
+        for textValue in ("检查病例", "整理训练数据", "生成 5 组实验"):
+            label = qt.QLabel("○ " + textValue)
+            label.setObjectName("mutedLabel")
+            stepLayout.addWidget(label)
+            self.datasetStepLabels.append(label)
+        layout.addWidget(stepCard)
+
+        self.datasetCaseTable = qt.QTableWidget(0, 4)
+        self.datasetCaseTable.setHorizontalHeaderLabels(["病例", "状态", "患者组", "问题"])
+        self.datasetCaseTable.setEditTriggers(qt.QAbstractItemView.NoEditTriggers)
+        self.datasetCaseTable.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
+        self.datasetCaseTable.setMaximumHeight(180)
+        layout.addWidget(self.datasetCaseTable)
+
+        buttonRow = qt.QHBoxLayout()
+        self.checkDatasetButton = self._primaryButton("检查全部病例")
+        self.checkDatasetButton.clicked.connect(self._startDatasetValidation)
+        buttonRow.addWidget(self.checkDatasetButton)
+        self.buildDatasetButton = self._secondaryButton("准备训练数据")
+        self.buildDatasetButton.clicked.connect(self._startDatasetBuild)
+        buttonRow.addWidget(self.buildDatasetButton)
+        buttonRow.addStretch(1)
+        layout.addLayout(buttonRow)
+
+        self.datasetResultLabel = qt.QLabel()
+        self.datasetResultLabel.setObjectName("resultMessage")
+        self.datasetResultLabel.setWordWrap(True)
+        layout.addWidget(self.datasetResultLabel)
+        self.datasetAdvancedLabel = qt.QLabel()
+        self.datasetAdvancedLabel.setObjectName("mutedLabel")
+        self.datasetAdvancedLabel.setWordWrap(True)
+        self.datasetAdvancedLabel.setVisible(False)
+        layout.addWidget(self.datasetAdvancedLabel)
+        layout.addStretch(1)
+        return page
+
+    def _buildTrainingPage(self):
+        page = self._card("contentCard")
+        layout = qt.QVBoxLayout(page)
+        layout.setContentsMargins(18, 18, 18, 18)
+        self._addPageHeader(
+            layout,
+            "实验步骤",
+            "模型训练",
+            "默认使用 nnU-Net v2 的 3D 下颌髁突分割模型和 5 组交叉验证。普通模式不需要修改机器学习参数。",
+        )
+
+        modelCard = self._card("hintCard")
+        modelLayout = qt.QFormLayout(modelCard)
+        modelLayout.setContentsMargins(13, 11, 13, 11)
+        modelLayout.addRow("模型：", qt.QLabel("3D 下颌髁突分割模型"))
+        modelLayout.addRow("训练方法：", qt.QLabel("nnU-Net 3D"))
+        modelLayout.addRow("实验方式：", qt.QLabel("5 组交叉验证"))
+        layout.addWidget(modelCard)
+
+        self.trainingEnvironmentLabel = qt.QLabel("正在准备系统检查…")
+        self.trainingEnvironmentLabel.setObjectName("resultMessage")
+        self.trainingEnvironmentLabel.setWordWrap(True)
+        layout.addWidget(self.trainingEnvironmentLabel)
+        self.trainingReadinessLabel = qt.QLabel()
+        self.trainingReadinessLabel.setObjectName("infoMessage")
+        self.trainingReadinessLabel.setWordWrap(True)
+        layout.addWidget(self.trainingReadinessLabel)
+        self.trainingGpuWarningLabel = qt.QLabel()
+        self.trainingGpuWarningLabel.setObjectName("resultMessage")
+        self.trainingGpuWarningLabel.setWordWrap(True)
+        layout.addWidget(self.trainingGpuWarningLabel)
+
+        foldTitle = qt.QLabel("训练进度")
+        foldTitle.setObjectName("sectionTitle")
+        layout.addWidget(foldTitle)
+        self.trainingFoldList = qt.QListWidget()
+        self.trainingFoldList.setMinimumHeight(145)
+        layout.addWidget(self.trainingFoldList)
+        self.trainingStageLabel = qt.QLabel("尚未开始训练")
+        self.trainingStageLabel.setObjectName("homeNextStep")
+        self.trainingStageLabel.setWordWrap(True)
+        layout.addWidget(self.trainingStageLabel)
+        self.trainingElapsedLabel = qt.QLabel("已运行时间：—")
+        self.trainingElapsedLabel.setObjectName("mutedLabel")
+        layout.addWidget(self.trainingElapsedLabel)
+
+        buttonRow = qt.QHBoxLayout()
+        self.trainingStartButton = self._primaryButton("开始 5 折训练")
+        self.trainingStartButton.clicked.connect(lambda checked=False: self._startTraining(False))
+        buttonRow.addWidget(self.trainingStartButton)
+        self.trainingResumeButton = self._secondaryButton("继续未完成训练")
+        self.trainingResumeButton.clicked.connect(lambda checked=False: self._startTraining(True))
+        buttonRow.addWidget(self.trainingResumeButton)
+        self.trainingStopButton = self._secondaryButton("停止训练")
+        self.trainingStopButton.clicked.connect(self._stopActiveProcess)
+        buttonRow.addWidget(self.trainingStopButton)
+        self.cpuSmokeButton = self._secondaryButton("使用 CPU 测试流程")
+        self.cpuSmokeButton.clicked.connect(self._runCpuSmoke)
+        buttonRow.addWidget(self.cpuSmokeButton)
+        layout.addLayout(buttonRow)
+
+        self.trainingLogWidget = qt.QPlainTextEdit()
+        self.trainingLogWidget.setObjectName("taskLog")
+        self.trainingLogWidget.setReadOnly(True)
+        self.trainingLogWidget.setMaximumHeight(180)
+        self.trainingLogWidget.setPlaceholderText("原始训练日志会显示在这里…")
+        layout.addWidget(self.trainingLogWidget)
+        self.trainingDetailsButton = self._linkButton("查看详细日志")
+        self.trainingDetailsButton.clicked.connect(self._showTrainingLogDialog)
+        layout.addWidget(self.trainingDetailsButton, 0, qt.Qt.AlignLeft)
+        layout.addStretch(1)
+        return page
+
+    def _buildResultsPage(self):
+        page = self._card("contentCard")
+        layout = qt.QVBoxLayout(page)
+        layout.setContentsMargins(18, 18, 18, 18)
+        self._addPageHeader(
+            layout,
+            "实验分析",
+            "实验结果",
+            "这里展示真实 OOF（每个病例只由没有见过它的验证折预测）结果。没有真实预测文件时不会显示假指标。",
+        )
+        runRow = qt.QHBoxLayout()
+        runRow.addWidget(qt.QLabel("实验记录："))
+        self.resultRunSelector = qt.QComboBox()
+        self.resultRunSelector.currentIndexChanged.connect(self._onResultRunChanged)
+        runRow.addWidget(self.resultRunSelector, 1)
+        self.refreshResultsButton = self._secondaryButton("刷新")
+        self.refreshResultsButton.clicked.connect(self._refreshResultsPage)
+        runRow.addWidget(self.refreshResultsButton)
+        layout.addLayout(runRow)
+
+        metricRow = qt.QHBoxLayout()
+        self.resultMetricLabels = {}
+        for key, caption, unit, explanation in (
+            ("dice", "Dice", "", "自动分割和人工标注的重合程度，越接近 1 越好。"),
+            ("iou", "IoU", "", "两个区域的重合程度，越高越好。"),
+            ("hd95_mm", "HD95", " mm", "自动边界和人工边界之间的距离，越小越好。"),
+        ):
+            card = self._card("metricCard")
+            cardLayout = qt.QVBoxLayout(card)
+            cardLayout.setContentsMargins(11, 9, 11, 9)
+            captionLabel = qt.QLabel(caption)
+            captionLabel.setObjectName("metricCaption")
+            valueLabel = qt.QLabel("暂无真实结果")
+            valueLabel.setObjectName("metricValue")
+            tipLabel = qt.QLabel(explanation)
+            tipLabel.setObjectName("mutedLabel")
+            tipLabel.setWordWrap(True)
+            cardLayout.addWidget(captionLabel)
+            cardLayout.addWidget(valueLabel)
+            cardLayout.addWidget(tipLabel)
+            metricRow.addWidget(card, 1)
+            self.resultMetricLabels[key] = valueLabel
+        layout.addLayout(metricRow)
+
+        self.resultsStatusLabel = qt.QLabel("暂无实验结果。完成真实训练、OOF 预测和评价后，这里会自动更新。")
+        self.resultsStatusLabel.setObjectName("resultMessage")
+        self.resultsStatusLabel.setWordWrap(True)
+        layout.addWidget(self.resultsStatusLabel)
+
+        foldTitle = qt.QLabel("5 折结果")
+        foldTitle.setObjectName("sectionTitle")
+        layout.addWidget(foldTitle)
+        self.resultFoldTable = qt.QTableWidget(0, 5)
+        self.resultFoldTable.setHorizontalHeaderLabels(["分组", "病例数量", "Dice", "IoU", "HD95"])
+        self.resultFoldTable.setEditTriggers(qt.QAbstractItemView.NoEditTriggers)
+        self.resultFoldTable.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
+        self.resultFoldTable.setMaximumHeight(165)
+        layout.addWidget(self.resultFoldTable)
+
+        caseTitle = qt.QLabel("病例级结果")
+        caseTitle.setObjectName("sectionTitle")
+        layout.addWidget(caseTitle)
+        self.resultCaseTable = qt.QTableWidget(0, 5)
+        self.resultCaseTable.setHorizontalHeaderLabels(["病例", "验证组", "Dice", "IoU", "HD95"])
+        self.resultCaseTable.setEditTriggers(qt.QAbstractItemView.NoEditTriggers)
+        self.resultCaseTable.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
+        self.resultCaseTable.setMinimumHeight(120)
+        self.resultCaseTable.currentCellChanged.connect(self._onResultCaseSelected)
+        layout.addWidget(self.resultCaseTable)
+
+        resultButtonRow = qt.QHBoxLayout()
+        self.resultCompareButton = self._primaryButton("查看 GT / Prediction 对比")
+        self.resultCompareButton.clicked.connect(self._showSelectedResultCase)
+        resultButtonRow.addWidget(self.resultCompareButton)
+        self.result3DButton = self._secondaryButton("查看 3D 对比")
+        self.result3DButton.clicked.connect(lambda checked=False: self._showSelectedResultCase(show3d=True))
+        resultButtonRow.addWidget(self.result3DButton)
+        resultButtonRow.addWidget(qt.QLabel("显示："))
+        self.resultViewModeSelector = qt.QComboBox()
+        self.resultViewModeSelector.addItems(["同时显示", "人工标注", "自动预测"])
+        self.resultViewModeSelector.currentIndexChanged.connect(self._applyResultViewMode)
+        resultButtonRow.addWidget(self.resultViewModeSelector)
+        self.resultExportButton = self._secondaryButton("导出实验结果")
+        self.resultExportButton.clicked.connect(self._exportCurrentExperiment)
+        resultButtonRow.addWidget(self.resultExportButton)
+        resultButtonRow.addStretch(1)
+        layout.addLayout(resultButtonRow)
+        layout.addStretch(1)
+        return page
+
+    def _buildPredictionPage(self):
+        page = self._card("contentCard")
+        layout = qt.QVBoxLayout(page)
+        layout.setContentsMargins(18, 18, 18, 18)
+        self._addPageHeader(
+            layout,
+            "模型应用",
+            "自动分割",
+            "选择一份新的匿名 MRI，系统会调用训练完成的五折 nnU-Net ensemble，生成髁突 mask 和 3D 显示。",
+        )
+        modelStatus = self._card("hintCard")
+        modelStatusLayout = qt.QVBoxLayout(modelStatus)
+        modelStatusLayout.setContentsMargins(13, 11, 13, 11)
+        self.predictionModelLabel = qt.QLabel("正在检查训练模型…")
+        self.predictionModelLabel.setObjectName("sectionTitle")
+        self.predictionModelLabel.setWordWrap(True)
+        modelStatusLayout.addWidget(self.predictionModelLabel)
+        self.predictionModelHintLabel = qt.QLabel()
+        self.predictionModelHintLabel.setObjectName("mutedLabel")
+        self.predictionModelHintLabel.setWordWrap(True)
+        modelStatusLayout.addWidget(self.predictionModelHintLabel)
+        layout.addWidget(modelStatus)
+
+        inputRow = qt.QHBoxLayout()
+        inputRow.addWidget(qt.QLabel("新的 MRI："))
+        self.predictionInputLabel = qt.QLabel("尚未选择")
+        self.predictionInputLabel.setObjectName("mutedLabel")
+        self.predictionInputLabel.setWordWrap(True)
+        inputRow.addWidget(self.predictionInputLabel, 1)
+        self.selectPredictionButton = self._secondaryButton("选择新的 MRI")
+        self.selectPredictionButton.clicked.connect(self._choosePredictionInput)
+        inputRow.addWidget(self.selectPredictionButton)
+        layout.addLayout(inputRow)
+
+        self.predictionStatusLabel = qt.QLabel("选择新的 MRI 后开始自动分割。")
+        self.predictionStatusLabel.setObjectName("resultMessage")
+        self.predictionStatusLabel.setWordWrap(True)
+        layout.addWidget(self.predictionStatusLabel)
+        buttonRow = qt.QHBoxLayout()
+        self.startPredictionButton = self._primaryButton("开始自动分割")
+        self.startPredictionButton.clicked.connect(self._startPrediction)
+        buttonRow.addWidget(self.startPredictionButton)
+        self.viewPrediction2DButton = self._secondaryButton("查看切片")
+        self.viewPrediction2DButton.clicked.connect(self._showPrediction2D)
+        buttonRow.addWidget(self.viewPrediction2DButton)
+        self.viewPrediction3DButton = self._secondaryButton("查看 3D")
+        self.viewPrediction3DButton.clicked.connect(self._showPrediction3D)
+        buttonRow.addWidget(self.viewPrediction3DButton)
+        self.exportPredictionButton = self._secondaryButton("导出结果")
+        self.exportPredictionButton.clicked.connect(self._exportPrediction)
+        buttonRow.addWidget(self.exportPredictionButton)
+        buttonRow.addStretch(1)
+        layout.addLayout(buttonRow)
+        opacityRow = qt.QHBoxLayout()
+        opacityRow.addWidget(qt.QLabel("预测透明度"))
+        self.predictionOpacitySlider = qt.QSlider(qt.Qt.Horizontal)
+        self.predictionOpacitySlider.setRange(20, 90)
+        self.predictionOpacitySlider.setValue(55)
+        self.predictionOpacitySlider.valueChanged.connect(self._onPredictionOpacityChanged)
+        opacityRow.addWidget(self.predictionOpacitySlider, 1)
+        self.predictionOpacityLabel = qt.QLabel("55%")
+        opacityRow.addWidget(self.predictionOpacityLabel)
+        layout.addLayout(opacityRow)
+        self.predictionLogWidget = qt.QPlainTextEdit()
+        self.predictionLogWidget.setObjectName("taskLog")
+        self.predictionLogWidget.setReadOnly(True)
+        self.predictionLogWidget.setMaximumHeight(150)
+        layout.addWidget(self.predictionLogWidget)
+        layout.addStretch(1)
+        return page
+
+    def _buildSettingsPage(self):
+        page = self._card("contentCard")
+        layout = qt.QVBoxLayout(page)
+        layout.setContentsMargins(18, 18, 18, 18)
+        self._addPageHeader(
+            layout,
+            "平台设置",
+            "设置",
+            "普通实验不需要修改这些选项。这里集中显示项目位置、固定任务定义和高级诊断入口。",
+        )
+        settingsCard = self._card("hintCard")
+        settingsLayout = qt.QFormLayout(settingsCard)
+        settingsLayout.setContentsMargins(13, 11, 13, 11)
+        self.settingsPythonLabel = qt.QLabel("—")
+        self.settingsPythonLabel.setWordWrap(True)
+        self.settingsDatasetLabel = qt.QLabel("—")
+        self.settingsDatasetLabel.setWordWrap(True)
+        self.settingsWorkspaceLabel = qt.QLabel("—")
+        self.settingsWorkspaceLabel.setWordWrap(True)
+        settingsLayout.addRow("项目 Python：", self.settingsPythonLabel)
+        settingsLayout.addRow("训练数据：", self.settingsDatasetLabel)
+        settingsLayout.addRow("工作区：", self.settingsWorkspaceLabel)
+        settingsLayout.addRow("固定配置：", qt.QLabel("nnU-Net v2 · 3d_fullres · binary · 5-fold"))
+        layout.addWidget(settingsCard)
+        self.settingsInfoLabel = qt.QLabel(
+            "高级信息只用于技术人员排查环境问题。患者身份不会写入实验记录；病例 ID 只允许使用匿名 case_… 标识。"
+        )
+        self.settingsInfoLabel.setObjectName("resultMessage")
+        self.settingsInfoLabel.setWordWrap(True)
+        layout.addWidget(self.settingsInfoLabel)
+        self.settingsAdvancedButton = self._secondaryButton("查看高级信息")
+        self.settingsAdvancedButton.clicked.connect(self._showSettingsAdvanced)
+        layout.addWidget(self.settingsAdvancedButton, 0, qt.Qt.AlignLeft)
+        layout.addStretch(1)
+        return page
+
     @staticmethod
     def _card(objectName):
         frame = qt.QFrame()
@@ -1024,6 +1629,1397 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         descriptionLabel.setWordWrap(True)
         layout.addWidget(descriptionLabel)
         layout.addSpacing(5)
+
+    # ------------------------------------------------------------------
+    # Top-level experiment-platform navigation
+    # ------------------------------------------------------------------
+    def _showMainPage(self, pageName):
+        pageName = str(pageName)
+        if pageName not in {name for name, _ in MAIN_NAVIGATION}:
+            return False
+        if pageName != "cases" and self._mainPage == "cases" and self._dirty:
+            if not self._confirmUnsaved():
+                return False
+        self._mainPage = pageName
+        self._homeVisible = pageName == "home"
+        if pageName == "home":
+            self.pageStack.setCurrentIndex(PAGE_HOME)
+            self._restoreWorkflowLayout()
+            self._setStatusMessage("欢迎使用。首页会根据当前状态告诉你下一步做什么。", "info")
+        elif pageName == "cases":
+            self._currentPage = 0
+            self.pageStack.setCurrentIndex(PAGE_CASE_IMPORT)
+            self._refreshCaseFiles()
+            self._setStatusMessage("病例与标注：导入病例、完成标注并保存。", "info")
+        elif pageName == "dataset":
+            self.pageStack.setCurrentIndex(PAGE_DATASET)
+            self._refreshDatasetPage()
+        elif pageName == "training":
+            self.pageStack.setCurrentIndex(PAGE_TRAINING)
+            self._refreshTrainingPage()
+            if self._process is None:
+                self._startEnvironmentCheck()
+        elif pageName == "results":
+            self.pageStack.setCurrentIndex(PAGE_RESULTS)
+            self._refreshResultsPage()
+        elif pageName == "prediction":
+            self.pageStack.setCurrentIndex(PAGE_PREDICTION)
+            self._refreshPredictionPage()
+        elif pageName == "settings":
+            self.pageStack.setCurrentIndex(PAGE_SETTINGS)
+            self._refreshSettingsPage()
+        self._updatePageChrome()
+        self._syncUi()
+        return True
+
+    def _updatePageChrome(self):
+        isCases = self._mainPage == "cases"
+        if hasattr(self, "stepBarWidget"):
+            self.stepBarWidget.setVisible(isCases)
+        if hasattr(self, "caseSummaryCard"):
+            self.caseSummaryCard.setVisible(isCases)
+        if hasattr(self, "navigationButtons"):
+            for key, button in self.navigationButtons.items():
+                button.setProperty("active", key == self._mainPage)
+                try:
+                    button.style().unpolish(button)
+                    button.style().polish(button)
+                except Exception:
+                    pass
+
+    def _selectedCaseListIndex(self):
+        if not hasattr(self, "caseListWidget"):
+            return self._currentCaseIndex
+        row = self.caseListWidget.currentRow
+        if callable(row):
+            row = row()
+        try:
+            row = int(row)
+        except (TypeError, ValueError):
+            row = -1
+        return row if 0 <= row < len(self._caseFiles) else self._currentCaseIndex
+
+    def _onCaseListRowChanged(self, row):
+        if self._isUpdating:
+            return
+        try:
+            row = int(row)
+        except (TypeError, ValueError):
+            return
+        if 0 <= row < len(self._caseFiles):
+            self._setStatusMessage(
+                f"已选择 {self._caseIdForIndex(self._caseFiles[row], row)}，点击“继续标注”打开。",
+                "info",
+            )
+            self._syncUi()
+
+    def _refreshCaseListWidget(self):
+        if not hasattr(self, "caseListWidget"):
+            return
+        selected = self._currentCaseIndex
+        self._isUpdating = True
+        try:
+            self.caseListWidget.clear()
+            for index, path in enumerate(self._caseFiles):
+                caseId = self._caseIdForIndex(path, index)
+                status = self._caseStatusForIndex(index)
+                self.caseListWidget.addItem(
+                    f"{caseId}    {self._statusSymbol(status)} {status}"
+                )
+            listCount = self._qtInt(self.caseListWidget, "count")
+            if 0 <= selected < listCount:
+                self.caseListWidget.setCurrentRow(selected)
+            elif listCount:
+                self.caseListWidget.setCurrentRow(0)
+        finally:
+            self._isUpdating = False
+
+    def _continueSelectedCase(self):
+        return self._openSelectedCase("continue")
+
+    def _viewSelectedCase(self):
+        return self._openSelectedCase("view")
+
+    def _reeditSelectedCase(self):
+        return self._openSelectedCase("reedit")
+
+    def _openSelectedCase(self, mode="continue"):
+        index = self._selectedCaseListIndex()
+        if index < 0 or index >= len(self._caseFiles):
+            self._setStatusMessage("请先导入或选择一个病例。", "warning")
+            return False
+        if not self._loadCaseAtIndex(index):
+            return False
+        if mode == "view" and self._caseStatusForIndex(index) == "已完成":
+            self._setStatusMessage("已加载这个病例，可以查看或重新编辑标注。", "success")
+        return self._startAnnotation()
+
+    # ------------------------------------------------------------------
+    # Non-blocking external workflow tasks
+    # ------------------------------------------------------------------
+    def _startExternalProcess(self, kind, command, *, logPath=None):
+        if self._process is not None:
+            self._setStatusMessage("已有任务正在运行，请等待完成或先停止当前任务。", "warning")
+            return False
+        try:
+            process = qt.QProcess(self.rootWidget)
+            environment = qt.QProcessEnvironment.systemEnvironment()
+            projectRoot = str(self.projectRoot.resolve())
+            existingPath = environment.value("PYTHONPATH") if hasattr(environment, "value") else ""
+            environment.insert(
+                "PYTHONPATH",
+                projectRoot + (os.pathsep + existingPath if existingPath else ""),
+            )
+            environment.insert("nnUNet_raw", str((self.projectRoot / "workspace" / "nnUNet_raw").resolve()))
+            environment.insert("nnUNet_preprocessed", str((self.projectRoot / "workspace" / "nnUNet_preprocessed").resolve()))
+            environment.insert("nnUNet_results", str((self.projectRoot / "workspace" / "nnUNet_results").resolve()))
+            process.setProcessEnvironment(environment)
+            process.setWorkingDirectory(projectRoot)
+            try:
+                process.setProcessChannelMode(qt.QProcess.MergedChannels)
+            except Exception:
+                pass
+            process.readyReadStandardOutput.connect(self._readProcessOutput)
+            try:
+                process.readyReadStandardError.connect(self._readProcessOutput)
+            except Exception:
+                pass
+            process.finished.connect(self._onProcessFinished)
+            try:
+                process.errorOccurred.connect(self._onProcessError)
+            except Exception:
+                pass
+            self._process = process
+            self._processKind = str(kind)
+            self._processOutput = ""
+            self._processLogPath = Path(logPath) if logPath else None
+            self._processStartedAt = time.monotonic()
+            self._processStopRequested = False
+            if self._processLogPath:
+                self._processLogPath.parent.mkdir(parents=True, exist_ok=True)
+                with self._processLogPath.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        f"\n===== {datetime.datetime.now().isoformat(timespec='seconds')} =====\n"
+                        f"COMMAND: {' '.join(str(value) for value in command)}\n"
+                    )
+            program = str(command[0])
+            arguments = [str(value) for value in command[1:]]
+            process.start(program, arguments)
+            if self._taskTimer is None:
+                self._taskTimer = qt.QTimer(self.rootWidget)
+                self._taskTimer.timeout.connect(self._updateTaskElapsed)
+            self._taskTimer.start(1000)
+            return True
+        except Exception:
+            self._process = None
+            self._setDetails("启动后台任务失败\n" + traceback.format_exc())
+            self._setStatusMessage("后台任务没有启动，请检查项目 Python 环境。", "warning")
+            return False
+
+    @staticmethod
+    def _qprocessBytes(value):
+        try:
+            return bytes(value.data()).decode("utf-8", errors="replace")
+        except Exception:
+            try:
+                return str(value)
+            except Exception:
+                return ""
+
+    def _readProcessOutput(self):
+        process = self._process
+        if process is None:
+            return
+        chunks = []
+        try:
+            chunks.append(self._qprocessBytes(process.readAllStandardOutput()))
+        except Exception:
+            pass
+        try:
+            chunks.append(self._qprocessBytes(process.readAllStandardError()))
+        except Exception:
+            pass
+        text = "".join(chunk for chunk in chunks if chunk)
+        if not text:
+            return
+        self._processOutput += text
+        if self._processLogPath:
+            try:
+                with self._processLogPath.open("a", encoding="utf-8") as handle:
+                    handle.write(text)
+            except Exception:
+                pass
+        if self._processKind == "training":
+            summaryLines = []
+            for line in text.splitlines():
+                event = parse_training_line(line)
+                if "event" in event:
+                    self._trainingFoldEvents[int(event["fold"])] = event
+                    if event.get("event") == "start":
+                        self._activeTrainingFold = int(event["fold"])
+                if event.get("event"):
+                    message = user_training_message(event)
+                    self.trainingStageLabel.setText(message)
+                    summaryLines.append(message)
+                elif event.get("epoch") is not None:
+                    if event.get("fold") is None and self._activeTrainingFold is not None:
+                        event = dict(event)
+                        event["fold"] = self._activeTrainingFold
+                    message = user_training_message(event)
+                    self.trainingStageLabel.setText(message)
+                    summaryLines.append(message)
+            self._refreshTrainingFoldList()
+            # Keep the default page readable for medical students.  The raw
+            # nnU-Net stdout is retained in _processOutput/logs and is shown
+            # only through “查看详细日志”.
+            if summaryLines:
+                self.trainingLogWidget.appendPlainText("\n".join(summaryLines))
+        elif self._processKind in {"prediction", "cpu_smoke"}:
+            self.predictionLogWidget.appendPlainText(text.rstrip())
+
+    def _onProcessError(self, error):
+        self._setDetails(
+            f"后台任务错误\n任务：{self._processKind}\n错误：{error}\n"
+            + self._processOutput[-4000:]
+        )
+
+    def _updateTaskElapsed(self):
+        if self._processStartedAt is None:
+            return
+        elapsed = max(0, int(time.monotonic() - self._processStartedAt))
+        minutes, seconds = divmod(elapsed, 60)
+        hours, minutes = divmod(minutes, 60)
+        textValue = f"已运行时间：{hours:02d}:{minutes:02d}:{seconds:02d}"
+        if hasattr(self, "trainingElapsedLabel") and self._processKind in {
+            "training", "oof", "evaluation"
+        }:
+            self.trainingElapsedLabel.setText(textValue)
+
+    def _stopActiveProcess(self):
+        process = self._process
+        if process is None:
+            self._setStatusMessage("当前没有正在运行的后台任务。", "info")
+            return False
+        self._processStopRequested = True
+        self._setStatusMessage("正在请求停止当前任务；已有 fold 的文件会保留。", "warning")
+        try:
+            process.terminate()
+            qt.QTimer.singleShot(2500, lambda: self._killProcessIfRunning(process))
+        except Exception:
+            self._killProcessIfRunning(process)
+        return True
+
+    def _killProcessIfRunning(self, process):
+        if self._process is not process:
+            return
+        try:
+            if process.state() != qt.QProcess.NotRunning:
+                process.kill()
+        except Exception:
+            pass
+
+    def _onProcessFinished(self, exitCode, *args):
+        process = self._process
+        kind = self._processKind
+        try:
+            exitCode = int(exitCode)
+        except (TypeError, ValueError):
+            exitCode = 1
+        stopped = self._processStopRequested
+        self._readProcessOutput()
+        if self._taskTimer is not None:
+            self._taskTimer.stop()
+        self._process = None
+        self._processKind = ""
+        self._processStartedAt = None
+        self._processStopRequested = False
+        if stopped:
+            if kind in {"training", "oof", "evaluation"} and self._currentRunDir:
+                finalize_experiment_run(
+                    self._currentRunDir,
+                    summary={"status": "stopped", "completed_folds": list(self._trainingFoldEvents)},
+                )
+            self._setStatusMessage("任务已停止。已完成的 fold 会在下次点击“继续未完成训练”时保留。", "warning")
+            self._refreshTrainingPage()
+            return
+        if kind == "environment":
+            self._finishEnvironmentCheck(exitCode)
+        elif kind == "dataset_validate":
+            self._finishDatasetValidation(exitCode)
+        elif kind == "dataset_build":
+            self._finishDatasetBuild(exitCode)
+        elif kind == "training":
+            self._finishTraining(exitCode)
+        elif kind == "oof":
+            self._finishOof(exitCode)
+        elif kind == "evaluation":
+            self._finishEvaluation(exitCode)
+        elif kind == "prediction":
+            self._finishPrediction(exitCode)
+        elif kind == "cpu_smoke":
+            self._finishCpuSmoke(exitCode)
+
+    def _startEnvironmentCheck(self):
+        if self._process is not None:
+            return False
+        self.trainingEnvironmentLabel.setText("正在检查 Python、nnU-Net、训练数据和显卡…")
+        return self._startExternalProcess(
+            "environment",
+            environment_command(project_root=self.projectRoot, python_executable=project_python_executable(self.projectRoot)),
+        )
+
+    def _startDatasetValidation(self):
+        if self._process is not None:
+            self._setStatusMessage("已有任务正在运行，请等待完成。", "warning")
+            return False
+        self._validationRows = []
+        self._validationPassed = False
+        self._datasetPrepared = False
+        self._setDatasetSteps(0)
+        self._setResultMessage(self.datasetResultLabel, "正在检查全部病例，请稍候…", "neutral")
+        return self._startExternalProcess(
+            "dataset_validate",
+            dataset_validation_command(
+                project_root=self.projectRoot,
+                python_executable=project_python_executable(self.projectRoot),
+            ),
+        )
+
+    def _startDatasetBuild(self):
+        if not self._validationPassed:
+            self._setResultMessage(self.datasetResultLabel, "请先检查全部病例；检查通过后才能准备训练数据。", "warning")
+            return False
+        self._setDatasetSteps(1)
+        self._setResultMessage(self.datasetResultLabel, "正在整理训练数据并生成 5 组实验…", "neutral")
+        return self._startExternalProcess(
+            "dataset_build",
+            dataset_build_command(
+                project_root=self.projectRoot,
+                python_executable=project_python_executable(self.projectRoot),
+            ),
+        )
+
+    def _finishEnvironmentCheck(self, exitCode):
+        try:
+            self._environmentReport = parse_environment_json(self._processOutput)
+        except Exception:
+            self._environmentReport = None
+            self._setDetails("环境检查没有返回可读报告\n" + self._processOutput[-6000:])
+        if self._environmentReport:
+            display = environment_display(self._environmentReport)
+            self.trainingEnvironmentLabel.setText(
+                "Python 环境　{python}\n"
+                "nnU-Net　{nnunet}\n"
+                "训练数据　{data}\n"
+                "显卡　{gpu}".format(**display)
+            )
+            if display["gpu"] != "✓":
+                self.trainingGpuWarningLabel.setText(
+                    "当前电脑没有检测到可用于训练的 NVIDIA 显卡。\n"
+                    "可以使用“CPU 测试流程”检查软件连接，或稍后在有兼容显卡的电脑正式训练。"
+                )
+            else:
+                self.trainingGpuWarningLabel.clear()
+            self._setDetails(
+                "环境检查（高级信息）\n"
+                + json.dumps(self._environmentReport, ensure_ascii=False, indent=2)
+            )
+        else:
+            self.trainingEnvironmentLabel.setText("环境检查失败，请打开高级信息查看原始日志。")
+            self.trainingGpuWarningLabel.setText("无法确认当前电脑是否适合正式训练。")
+        self._refreshTrainingPage()
+        if exitCode == 0 and self._environmentReport:
+            self._setStatusMessage("系统检查完成。", "success")
+        else:
+            self._setStatusMessage("系统检查没有完整通过，请查看训练页提示。", "warning")
+
+    def _finishDatasetValidation(self, exitCode):
+        self._validationRows = read_validation_csv(self.projectRoot / "workspace" / "reports" / "dataset_validation.csv")
+        self._validationPassed = bool(self._validationRows) and exitCode == 0 and all(
+            str(row.get("status")) == "PASS" for row in self._validationRows
+        )
+        self._setDatasetSteps(1 if self._validationPassed else 0)
+        self._refreshDatasetPage()
+        if self._validationPassed:
+            self._setResultMessage(
+                self.datasetResultLabel,
+                f"✓ {len(self._validationRows)} 个病例可以用于训练。下一步可以准备训练数据。",
+                "success",
+            )
+            self._setStatusMessage("病例检查通过，可以准备训练数据。", "success")
+        else:
+            failed = [row for row in self._validationRows if row.get("status") == "FAIL"]
+            details = [f"发现 {len(failed)} 个问题："]
+            for row in failed[:12]:
+                issue = row.get("errors") or "需要人工确认"
+                details.append(f"{row.get('case_id', '未知病例')}：{issue}")
+            if not failed:
+                details.append("没有找到可用于训练的已标注病例。")
+            self._setResultMessage(self.datasetResultLabel, "\n".join(details), "warning")
+            self._setStatusMessage("数据检查未通过，正式实验暂时不能开始。", "warning")
+
+    def _finishDatasetBuild(self, exitCode):
+        datasetPath = self.projectRoot / "workspace" / "nnUNet_raw" / "Dataset501_CondyleMRI" / "dataset.json"
+        splitPath = self.projectRoot / "workspace" / "nnUNet_preprocessed" / "Dataset501_CondyleMRI" / "splits_final.json"
+        try:
+            splitCount = len(read_splits(splitPath)) if splitPath.exists() else 0
+        except Exception:
+            splitCount = 0
+        self._datasetPrepared = exitCode == 0 and datasetPath.exists() and splitCount == len(FOLDS)
+        self._preprocessingPrepared = False
+        if self._datasetPrepared:
+            self._setDatasetSteps(3)
+            self._setResultMessage(
+                self.datasetResultLabel,
+                "✓ 训练数据准备完成\n已生成真实病例数据和 grouped 5-fold 分组，可以进入模型训练。",
+                "success",
+            )
+            self._setStatusMessage("训练数据准备完成，可以进入模型训练。", "success")
+        else:
+            self._setResultMessage(
+                self.datasetResultLabel,
+                "训练数据没有准备完成，请查看高级信息和详细日志。",
+                "warning",
+            )
+            self._setStatusMessage("训练数据准备失败，正式训练暂时不能开始。", "warning")
+        self._setDetails(
+            f"数据准备结果\nDataset：{datasetPath}\nsplits：{splitPath}\n"
+            f"fold 数量：{splitCount}\n原始输出：\n{self._processOutput[-5000:]}"
+        )
+        self._refreshDatasetPage()
+        self._refreshTrainingPage()
+
+    def _setDatasetSteps(self, completed):
+        if not hasattr(self, "datasetStepLabels"):
+            return
+        try:
+            completed = int(completed)
+        except (TypeError, ValueError):
+            completed = 0
+        for index, label in enumerate(self.datasetStepLabels):
+            if index < completed:
+                label.setText("✓ " + ("检查病例", "整理训练数据", "生成 5 组实验")[index])
+            elif index == completed:
+                label.setText("● " + ("检查病例", "整理训练数据", "生成 5 组实验")[index])
+            else:
+                label.setText("○ " + ("检查病例", "整理训练数据", "生成 5 组实验")[index])
+
+    def _inventoryAndCounts(self):
+        try:
+            inventory = load_case_inventory(
+                manifest_path=self.manifestPath,
+                images_dir=self.niftiDir,
+                labels_dir=self.labelsDir,
+            )
+        except Exception as exc:
+            inventory = []
+            self._setDetails(f"病例统计失败\n{type(exc).__name__}: {exc}")
+        return inventory, case_counts(inventory, validation_rows=self._validationRows)
+
+    def _refreshDatasetPage(self):
+        if not hasattr(self, "datasetSummaryLabel"):
+            return
+        inventory, counts = self._inventoryAndCounts()
+        annotated = int(counts["annotated"])
+        trainable = int(counts["trainable"])
+        issues = int(counts["issues"])
+        self.datasetSummaryLabel.setText(
+            f"病例总数：{counts['total']}　　已完成标注：{annotated}\n"
+            f"可以训练：{trainable}　　存在问题：{issues}"
+        )
+        self.datasetGuidanceLabel.setText(
+            count_guidance(int(counts["group_count"]))
+            + ("\n同一患者的左右侧会自动放在同一折，避免数据泄漏。" if counts["group_count"] else "")
+        )
+        self.datasetCaseTable.setRowCount(0)
+        validationByCase = {str(row.get("case_id")): row for row in self._validationRows}
+        for item in inventory:
+            rowIndex = self._qtInt(self.datasetCaseTable, "rowCount")
+            self.datasetCaseTable.insertRow(rowIndex)
+            validation = validationByCase.get(str(item.get("case_id")), {})
+            values = (
+                item.get("case_id", ""),
+                item.get("status", ""),
+                item.get("group_id", ""),
+                validation.get("errors") or ", ".join(item.get("problems", [])) or "—",
+            )
+            for column, value in enumerate(values):
+                self.datasetCaseTable.setItem(rowIndex, column, qt.QTableWidgetItem(str(value)))
+        self.buildDatasetButton.setEnabled(self._validationPassed and self._process is None)
+        self.checkDatasetButton.setEnabled(self._process is None)
+        self.datasetAdvancedLabel.setText(
+            "高级信息：\n"
+            f"Dataset501_CondyleMRI：{self.projectRoot / 'workspace' / 'nnUNet_raw' / 'Dataset501_CondyleMRI'}\n"
+            f"splits_final.json：{self.projectRoot / 'workspace' / 'nnUNet_preprocessed' / 'Dataset501_CondyleMRI' / 'splits_final.json'}"
+        )
+
+    def _refreshTrainingFoldList(self):
+        if not hasattr(self, "trainingFoldList"):
+            return
+        states = detect_fold_states(fold_results_directory(results_root=self.projectRoot / "workspace" / "nnUNet_results"))
+        self.trainingFoldList.clear()
+        for state in states:
+            event = self._trainingFoldEvents.get(state.fold, {})
+            eventName = event.get("event")
+            if eventName == "start":
+                status = "训练中"
+                symbol = "●"
+            elif eventName == "failed":
+                status = "未完成"
+                symbol = "!"
+            elif eventName == "complete" or state.completed:
+                status = "完成"
+                symbol = "✓"
+            elif state.resumable:
+                status = "可继续"
+                symbol = "●"
+            else:
+                status = "等待"
+                symbol = "○"
+            self.trainingFoldList.addItem(f"第 {state.fold + 1} 组 / Fold {state.fold + 1}    {symbol} {status}")
+
+    def _refreshTrainingPage(self):
+        if not hasattr(self, "trainingStartButton"):
+            return
+        if not self._validationRows:
+            self._validationRows = read_validation_csv(self.projectRoot / "workspace" / "reports" / "dataset_validation.csv")
+        if self._validationRows:
+            self._validationPassed = all(str(row.get("status")) == "PASS" for row in self._validationRows)
+        splitPath = self.projectRoot / "workspace" / "nnUNet_preprocessed" / "Dataset501_CondyleMRI" / "splits_final.json"
+        datasetPath = self.projectRoot / "workspace" / "nnUNet_raw" / "Dataset501_CondyleMRI" / "dataset.json"
+        fingerprintPath = self.projectRoot / "workspace" / "nnUNet_preprocessed" / "Dataset501_CondyleMRI" / "dataset_fingerprint.json"
+        plansPath = self.projectRoot / "workspace" / "nnUNet_preprocessed" / "Dataset501_CondyleMRI" / "nnUNetPlans.json"
+        self._datasetPrepared = self._datasetPrepared or (datasetPath.exists() and splitPath.exists())
+        self._preprocessingPrepared = self._preprocessingPrepared or (fingerprintPath.exists() and plansPath.exists())
+        inventory, counts = self._inventoryAndCounts()
+        cudaReady = bool(
+            self._environmentReport
+            and isinstance(self._environmentReport.get("cuda"), dict)
+            and self._environmentReport["cuda"].get("status") == "PASS"
+        )
+        envReady = bool(self._environmentReport and self._environmentReport.get("nnunet_ready"))
+        readiness = assess_training_readiness(
+            annotated_cases=int(counts["annotated"]),
+            group_count=int(counts["group_count"]),
+            validation_passed=self._validationPassed,
+            environment_ready=envReady,
+            gpu_ready=cudaReady,
+            dataset_prepared=self._datasetPrepared,
+        )
+        self.trainingReadinessLabel.setText(
+            ("✓ " if readiness.formal_ready else "") + readiness.message
+            + ("\n" + "\n".join(readiness.reasons) if readiness.reasons and not readiness.formal_ready else "")
+        )
+        self._refreshTrainingFoldList()
+        states = detect_fold_states(fold_results_directory(results_root=self.projectRoot / "workspace" / "nnUNet_results"))
+        incomplete = any(state.resumable for state in states)
+        running = self._process is not None
+        self.trainingStartButton.setEnabled(readiness.formal_ready and not running)
+        self.trainingResumeButton.setEnabled(readiness.formal_ready and incomplete and not running)
+        self.trainingStopButton.setEnabled(running and self._processKind in {"training", "oof", "evaluation"})
+        self.cpuSmokeButton.setEnabled(readiness.pipeline_ready and not running)
+        self.trainingDetailsButton.setEnabled(bool(self._processOutput or self._currentRunDir))
+        if not running and self._processKind == "":
+            if readiness.level == "blocked_gpu":
+                self.trainingStageLabel.setText("当前机器暂不适合正式训练。可以先运行 CPU 流程检查。")
+            elif readiness.formal_ready:
+                self.trainingStageLabel.setText("可以开始正式 5 折训练。")
+            elif not counts["annotated"]:
+                self.trainingStageLabel.setText("当前还没有足够的人工标注病例，无法进行正式实验。")
+
+    def _ensureExperimentRun(self, resume=False):
+        if self._currentRunDir and self._currentRunDir.exists():
+            return self._currentRunDir
+        _, counts = self._inventoryAndCounts()
+        cuda = self._environmentReport.get("cuda", {}) if self._environmentReport else {}
+        packages = self._environmentReport.get("packages", {}) if self._environmentReport else {}
+        modelPath = fold_results_directory(
+            results_root=self.projectRoot / "workspace" / "nnUNet_results"
+        )
+        self._currentRunDir = create_experiment_run(
+            workspace_dir=self.projectRoot / "workspace",
+            config={
+                "case_count": counts.get("total", 0),
+                "annotated_count": counts.get("annotated", 0),
+                "group_count": counts.get("group_count", 0),
+                "validation_passed": self._validationPassed,
+                "device": "cuda",
+                "gpu": cuda.get("device_name", "unavailable"),
+                "nnunet_version": packages.get("nnunetv2", "unknown"),
+                "configuration": "3d_fullres",
+                "folds": list(FOLDS),
+                "model_path": str(modelPath),
+                "resume": bool(resume),
+                "model": "nnU-Net v2 3d_fullres",
+            },
+        )
+        return self._currentRunDir
+
+    def _startTraining(self, resume=False):
+        if self._process is not None:
+            return False
+        if not self._environmentReport:
+            self._setStatusMessage("正在检查训练环境，请检查完成后再开始训练。", "info")
+            self._startEnvironmentCheck()
+            return False
+        self._refreshTrainingPage()
+        _, counts = self._inventoryAndCounts()
+        cudaReady = bool(
+            isinstance(self._environmentReport.get("cuda"), dict)
+            and self._environmentReport["cuda"].get("status") == "PASS"
+        )
+        readiness = assess_training_readiness(
+            annotated_cases=int(counts["annotated"]),
+            group_count=int(counts["group_count"]),
+            validation_passed=self._validationPassed,
+            environment_ready=bool(self._environmentReport.get("nnunet_ready")),
+            gpu_ready=cudaReady,
+            dataset_prepared=self._datasetPrepared,
+        )
+        if not readiness.formal_ready:
+            self._setStatusMessage(readiness.message, "warning")
+            return False
+        runDir = self._ensureExperimentRun(resume=resume)
+        self._trainingFoldEvents = {}
+        self._activeTrainingFold = None
+        self.trainingLogWidget.clear()
+        self.trainingStageLabel.setText("正在准备数据和训练任务…")
+        command = training_command(
+            device="cuda",
+            resume=bool(resume),
+            plan=not self._preprocessingPrepared,
+            project_root=self.projectRoot,
+            python_executable=project_python_executable(self.projectRoot),
+        )
+        started = self._startExternalProcess(
+            "training",
+            command,
+            logPath=runDir / "logs" / "training.log",
+        )
+        if started:
+            self._setStatusMessage(
+                "正式 5 折训练已在后台开始，Slicer 仍然可以操作。",
+                "success",
+            )
+            self._refreshTrainingPage()
+        return started
+
+    def _finishTraining(self, exitCode):
+        self._refreshTrainingPage()
+        if exitCode != 0:
+            self.trainingStageLabel.setText("训练没有完成；已完成的 fold 会保留，可以继续未完成训练。")
+            self._setStatusMessage("训练任务未完成，请查看详细日志。", "warning")
+            return
+        self._preprocessingPrepared = True
+        self.trainingStageLabel.setText("5 折训练完成，正在生成真实 OOF 预测…")
+        self._setStatusMessage("训练完成，正在生成验证集预测。", "success")
+        self._startExternalProcess(
+            "oof",
+            oof_command(
+                device="cuda",
+                project_root=self.projectRoot,
+                python_executable=project_python_executable(self.projectRoot),
+            ),
+            logPath=(self._currentRunDir / "logs" / "training.log") if self._currentRunDir else None,
+        )
+
+    def _finishOof(self, exitCode):
+        if exitCode != 0:
+            self.trainingStageLabel.setText("OOF 预测没有完成，实验结果暂不可用。")
+            self._setStatusMessage("真实 OOF 预测失败，没有生成假指标。", "warning")
+            return
+        self.trainingStageLabel.setText("OOF 预测完成，正在计算 Dice / IoU / HD95…")
+        self._startExternalProcess(
+            "evaluation",
+            evaluation_command(
+                project_root=self.projectRoot,
+                python_executable=project_python_executable(self.projectRoot),
+            ),
+            logPath=(self._currentRunDir / "logs" / "training.log") if self._currentRunDir else None,
+        )
+
+    def _finishEvaluation(self, exitCode):
+        if exitCode != 0 or not has_evaluation_results(self.projectRoot / "workspace" / "reports"):
+            self.trainingStageLabel.setText("评价没有完成，实验结果暂不可用。")
+            self._setStatusMessage("评价失败，没有显示假指标。", "warning")
+            return
+        summary = read_metrics_summary(self.projectRoot / "workspace" / "reports" / "metrics_summary.csv")
+        rows = read_metrics_csv(self.projectRoot / "workspace" / "reports" / "metrics_per_case.csv")
+        if self._currentRunDir:
+            finalize_experiment_run(
+                self._currentRunDir,
+                summary={
+                    "status": "complete",
+                    "completed_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "case_count": len(rows),
+                    "metrics": summary,
+                    "completed_folds": list(FOLDS),
+                },
+            )
+        self.trainingStageLabel.setText("训练、OOF 预测和评价全部完成。")
+        self._setStatusMessage("实验完成，可以查看 Dice / IoU / HD95。", "success")
+        self._refreshResultsPage()
+        self._refreshTrainingPage()
+
+    def _runCpuSmoke(self):
+        if self._process is not None:
+            return False
+        self._refreshTrainingPage()
+        _, counts = self._inventoryAndCounts()
+        if not self._validationPassed or int(counts["group_count"]) < len(FOLDS):
+            self._setStatusMessage("请先准备至少 5 个通过检查的不同患者组。", "warning")
+            return False
+        self.trainingStageLabel.setText("正在运行 CPU 流程检查（不会训练模型，也不会生成指标）…")
+        command = script_command(
+            "pipeline_smoke.py",
+            project_root=self.projectRoot,
+            python_executable=project_python_executable(self.projectRoot),
+        )
+        return self._startExternalProcess("cpu_smoke", command)
+
+    def _finishCpuSmoke(self, exitCode):
+        if exitCode == 0:
+            self.trainingStageLabel.setText("CPU 流程检查通过；没有运行正式训练，也没有生成实验指标。")
+            self._setStatusMessage("CPU 流程检查完成。正式结果仍需要兼容 CUDA GPU。", "success")
+        else:
+            self.trainingStageLabel.setText("CPU 流程检查未通过，请查看日志。")
+            self._setStatusMessage("CPU 流程检查失败。", "warning")
+
+    # ------------------------------------------------------------------
+    # Experiment results and history
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _comboData(combo, index):
+        try:
+            value = combo.itemData(index)
+            if callable(value):
+                value = value()
+            return value
+        except Exception:
+            return None
+
+    @staticmethod
+    def _qtInt(obj, attribute, default=0):
+        try:
+            value = getattr(obj, attribute)
+            if callable(value):
+                value = value()
+            return int(value)
+        except (AttributeError, TypeError, ValueError):
+            return int(default)
+
+    @staticmethod
+    def _resolvePath(value, root):
+        if not value:
+            return None
+        path = Path(str(value))
+        if not path.is_absolute():
+            path = Path(root) / path
+        return path.resolve()
+
+    def _refreshResultsPage(self):
+        if not hasattr(self, "resultRunSelector"):
+            return
+        current = str(self._resultRunDir) if self._resultRunDir else ""
+        self.resultRunSelector.blockSignals(True)
+        try:
+            self.resultRunSelector.clear()
+            runs = list_experiment_runs(self.projectRoot / "workspace")
+            for run in runs:
+                record = read_experiment_record(run)
+                summary = record.get("summary", {}) if isinstance(record, dict) else {}
+                metrics = summary.get("metrics", {}) if isinstance(summary, dict) else {}
+                dice = metrics.get("dice", {}) if isinstance(metrics, dict) else {}
+                mean = dice.get("mean") if isinstance(dice, dict) else None
+                label = run.name
+                if mean is not None:
+                    label += f"　Dice {format_metric(mean)}"
+                self.resultRunSelector.addItem(label, str(run))
+            reportRoot = self.projectRoot / "workspace" / "reports"
+            if has_evaluation_results(reportRoot):
+                self.resultRunSelector.addItem("当前报告（未归档实验）", "__reports__")
+            comboCount = self._qtInt(self.resultRunSelector, "count")
+            if comboCount == 0:
+                self.resultRunSelector.addItem("暂无真实实验记录", "")
+            chosen = -1
+            for index in range(self._qtInt(self.resultRunSelector, "count")):
+                if str(self._comboData(self.resultRunSelector, index) or "") == current:
+                    chosen = index
+                    break
+            if chosen >= 0:
+                self.resultRunSelector.setCurrentIndex(chosen)
+            elif current:
+                self.resultRunSelector.setCurrentIndex(0)
+        finally:
+            self.resultRunSelector.blockSignals(False)
+        index = self.resultRunSelector.currentIndex
+        if callable(index):
+            index = index()
+        self._loadResultSource(self._comboData(self.resultRunSelector, int(index)))
+
+    def _onResultRunChanged(self, index):
+        self._loadResultSource(self._comboData(self.resultRunSelector, int(index)))
+
+    def _loadResultSource(self, source):
+        if source and str(source) != "__reports__":
+            sourcePath = Path(str(source))
+            self._resultRunDir = sourcePath if sourcePath.exists() else None
+        else:
+            self._resultRunDir = None
+        sourceRoot = self._resultRunDir or (self.projectRoot / "workspace" / "reports")
+        summaryPath = sourceRoot / "metrics_summary.csv"
+        casePath = sourceRoot / "metrics_per_case.csv"
+        self._resultSummary = read_metrics_summary(summaryPath)
+        self._resultRows = read_metrics_csv(casePath)
+        self._updateResultsWidgets(sourceRoot)
+
+    def _updateResultsWidgets(self, sourceRoot):
+        for key in ("dice", "iou", "hd95_mm"):
+            row = self._resultSummary.get(key, {})
+            unit = " mm" if key == "hd95_mm" else ""
+            self.resultMetricLabels[key].setText(
+                format_metric(row.get("mean"), row.get("std"), unit=unit)
+            )
+        if not self._resultRows:
+            self.resultsStatusLabel.setText(
+                "暂无真实实验结果。完成真实训练、OOF 预测和评价后，这里会显示病例级指标。"
+            )
+        else:
+            self.resultsStatusLabel.setText(
+                f"已读取 {len(self._resultRows)} 个真实 OOF 病例结果。"
+                "预测来自对应验证折，不是训练集结果。"
+            )
+        self.resultFoldTable.setRowCount(0)
+        for row in summarize_metrics_by_fold(self._resultRows):
+            rowIndex = self._qtInt(self.resultFoldTable, "rowCount")
+            self.resultFoldTable.insertRow(rowIndex)
+            values = (
+                f"第 {int(row['fold']) + 1} 组 / Fold {int(row['fold']) + 1}",
+                row.get("case_count", 0),
+                format_metric(row.get("dice_mean"), row.get("dice_std")),
+                format_metric(row.get("iou_mean"), row.get("iou_std")),
+                format_metric(row.get("hd95_mm_mean"), row.get("hd95_mm_std"), unit=" mm"),
+            )
+            for column, value in enumerate(values):
+                self.resultFoldTable.setItem(rowIndex, column, qt.QTableWidgetItem(str(value)))
+        self.resultCaseTable.setRowCount(0)
+        for row in self._resultRows:
+            rowIndex = self._qtInt(self.resultCaseTable, "rowCount")
+            self.resultCaseTable.insertRow(rowIndex)
+            values = (
+                row.get("case_id", ""),
+                f"第 {int(row.get('fold', 0)) + 1} 组" if str(row.get("fold", "")).isdigit() else "—",
+                format_metric(row.get("dice")),
+                format_metric(row.get("iou")),
+                format_metric(row.get("hd95_mm"), unit=" mm"),
+            )
+            for column, value in enumerate(values):
+                self.resultCaseTable.setItem(rowIndex, column, qt.QTableWidgetItem(str(value)))
+        self.resultCompareButton.setEnabled(bool(self._resultRows))
+        self.result3DButton.setEnabled(bool(self._resultRows))
+        self.resultExportButton.setEnabled(bool(self._resultRunDir))
+        self._setDetails(
+            f"实验结果来源：{sourceRoot}\n"
+            f"metrics_summary.csv：{sourceRoot / 'metrics_summary.csv'}\n"
+            f"metrics_per_case.csv：{sourceRoot / 'metrics_per_case.csv'}"
+        )
+
+    def _onResultCaseSelected(self, row, *args):
+        try:
+            index = int(row)
+        except (TypeError, ValueError):
+            return
+        if 0 <= index < len(self._resultRows):
+            self._selectedResultCase = self._resultRows[index]
+
+    def _selectedResultRow(self):
+        if self._selectedResultCase:
+            return self._selectedResultCase
+        row = self.resultCaseTable.currentRow
+        if callable(row):
+            row = row()
+        try:
+            row = int(row)
+        except (TypeError, ValueError):
+            row = 0
+        if 0 <= row < len(self._resultRows):
+            self._selectedResultCase = self._resultRows[row]
+            return self._selectedResultCase
+        return self._resultRows[0] if self._resultRows else None
+
+    def _showSelectedResultCase(self, show3d=False):
+        row = self._selectedResultRow()
+        if not row:
+            self._setStatusMessage("当前没有可查看的病例级实验结果。", "warning")
+            return False
+        caseId = str(row.get("case_id", ""))
+        fold = int(row.get("fold", 0))
+        manifestRows = read_manifest(self.manifestPath)
+        manifestRow = next((item for item in manifestRows if item.get("case_id") == caseId), None)
+        if manifestRow is None:
+            self._setStatusMessage("这个病例不在匿名 manifest 中，无法显示对比。", "warning")
+            return False
+        imagePath = self._resolvePath(manifestRow.get("image_path"), self.projectRoot)
+        labelPath = self._resolvePath(manifestRow.get("label_path"), self.projectRoot)
+        predictionPath = (
+            self.projectRoot / "workspace" / "predictions" / "oof" / f"fold_{fold}" / f"{caseId}.nii.gz"
+        ).resolve()
+        if not imagePath or not labelPath or not imagePath.exists() or not labelPath.exists() or not predictionPath.exists():
+            self._setStatusMessage("GT 或真实 OOF Prediction 文件缺失，不能显示对比。", "warning")
+            return False
+        try:
+            self._loadResultComparison(imagePath, labelPath, predictionPath)
+            if show3d:
+                self._showResult3D()
+            else:
+                self._showResult2D()
+            self._setStatusMessage(
+                f"已显示 {caseId}：人工标注为绿色，模型预测为蓝色。", "success"
+            )
+            return True
+        except Exception:
+            self._setDetails("加载 GT / Prediction 对比失败\n" + traceback.format_exc())
+            self._setStatusMessage("对比视图没有成功加载，请查看高级信息。", "warning")
+            return False
+
+    def _removeNodeSafely(self, node):
+        if not node:
+            return
+        try:
+            slicer.mrmlScene.RemoveNode(node)
+        except Exception:
+            pass
+
+    def _clearResultComparison(self):
+        for name in (
+            "_resultImageNode",
+            "_resultGroundTruthNode",
+            "_resultPredictionNode",
+            "_resultCompareSegmentationNode",
+        ):
+            node = getattr(self, name, None)
+            self._removeNodeSafely(node)
+            setattr(self, name, None)
+
+    def _loadResultComparison(self, imagePath, labelPath, predictionPath):
+        self._clearResultComparison()
+        loaded = slicer.util.loadVolume(str(imagePath), returnNode=True)
+        self._resultImageNode = loaded[1] if isinstance(loaded, tuple) else loaded
+        gtLoaded = slicer.util.loadLabelVolume(str(labelPath), returnNode=True)
+        predLoaded = slicer.util.loadLabelVolume(str(predictionPath), returnNode=True)
+        gtNode = gtLoaded[1] if isinstance(gtLoaded, tuple) else gtLoaded
+        predNode = predLoaded[1] if isinstance(predLoaded, tuple) else predLoaded
+        if not self._resultImageNode or not gtNode or not predNode:
+            raise RuntimeError("Slicer could not load image/label/prediction")
+        seg = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", "TMJ_GT_Prediction_Comparison")
+        seg.CreateDefaultDisplayNodes()
+        seg.SetReferenceImageGeometryParameterFromVolumeNode(self._resultImageNode)
+        logic = slicer.modules.segmentations.logic()
+        if logic.ImportLabelmapToSegmentationNode(gtNode, seg) is False:
+            raise RuntimeError("could not import ground truth label")
+        if logic.ImportLabelmapToSegmentationNode(predNode, seg) is False:
+            raise RuntimeError("could not import prediction label")
+        segmentation = seg.GetSegmentation()
+        if segmentation.GetNumberOfSegments() < 2:
+            raise RuntimeError("comparison requires two non-empty segments")
+        gtId = segmentation.GetNthSegmentID(0)
+        predId = segmentation.GetNthSegmentID(1)
+        segmentation.GetSegment(gtId).SetName("人工标注")
+        segmentation.GetSegment(gtId).SetColor(0.15, 0.8, 0.3)
+        segmentation.GetSegment(predId).SetName("模型预测")
+        segmentation.GetSegment(predId).SetColor(0.15, 0.4, 0.95)
+        self._resultCompareSegmentationNode = seg
+        self._removeNodeSafely(gtNode)
+        self._removeNodeSafely(predNode)
+        self._setResultDisplaySettings()
+        self._showVolumeInSliceViews(self._resultImageNode)
+
+    def _setResultDisplaySettings(self):
+        seg = self._resultCompareSegmentationNode
+        if not seg:
+            return
+        display = seg.GetDisplayNode()
+        if not display:
+            return
+        try:
+            display.SetVisibility(True)
+            display.SetVisibility2DFill(True)
+            display.SetVisibility2DOutline(True)
+            display.SetVisibility3D(True)
+            display.SetOpacity(0.45)
+            if hasattr(display, "SetOpacity3D"):
+                display.SetOpacity3D(0.7)
+            for index in range(seg.GetSegmentation().GetNumberOfSegments()):
+                segmentId = seg.GetSegmentation().GetNthSegmentID(index)
+                if hasattr(display, "SetSegmentVisibility"):
+                    display.SetSegmentVisibility(segmentId, True)
+                if hasattr(display, "SetSegmentVisibility3D"):
+                    display.SetSegmentVisibility3D(segmentId, True)
+                if hasattr(display, "SetSegmentOpacity"):
+                    display.SetSegmentOpacity(segmentId, 0.45)
+                if hasattr(display, "SetSegmentOpacity3D"):
+                    display.SetSegmentOpacity3D(segmentId, 0.7)
+        except Exception:
+            pass
+
+    def _showResult2D(self):
+        if not self._resultCompareSegmentationNode or not self._resultImageNode:
+            return False
+        self._setCheckLayout()
+        self._showVolumeInSliceViews(self._resultImageNode)
+        self._setResultDisplaySettings()
+        self._setDetails(self._lastDetailText + "\n2D 图例：人工标注=绿色；模型预测=蓝色")
+        return True
+
+    def _applyResultViewMode(self, index):
+        seg = self._resultCompareSegmentationNode
+        if not seg:
+            return
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            index = 0
+        display = seg.GetDisplayNode()
+        if not display:
+            return
+        for segmentIndex in range(seg.GetSegmentation().GetNumberOfSegments()):
+            segmentId = seg.GetSegmentation().GetNthSegmentID(segmentIndex)
+            visible = index == 0 or (index == 1 and segmentIndex == 0) or (index == 2 and segmentIndex == 1)
+            try:
+                display.SetSegmentVisibility(segmentId, visible)
+                display.SetSegmentVisibility3D(segmentId, visible)
+            except Exception:
+                pass
+
+    def _showResult3D(self):
+        if not self._resultCompareSegmentationNode:
+            return False
+        seg = self._resultCompareSegmentationNode
+        seg.CreateClosedSurfaceRepresentation()
+        self._setResultDisplaySettings()
+        display = seg.GetDisplayNode()
+        if display and hasattr(display, "SetPreferredDisplayRepresentationName3D"):
+            try:
+                closedName = slicer.vtkSegmentationConverter.GetSegmentationClosedSurfaceRepresentationName()
+            except Exception:
+                closedName = "Closed surface"
+            display.SetPreferredDisplayRepresentationName3D(closedName)
+        manager = slicer.app.layoutManager()
+        layoutClass = getattr(slicer, "vtkMRMLLayoutNode", None)
+        layoutValue = getattr(layoutClass, "SlicerLayoutFourUpView", None) if layoutClass else None
+        if layoutValue is not None:
+            manager.setLayout(layoutValue)
+        threeDCount = getattr(manager, "threeDViewCount", 0)
+        if callable(threeDCount):
+            threeDCount = threeDCount()
+        if threeDCount > 0:
+            widget = manager.threeDWidget(0)
+            view = widget.threeDView()
+            view.show()
+            if hasattr(view, "resetCamera"):
+                view.resetCamera()
+            if hasattr(view, "resetFocalPoint"):
+                view.resetFocalPoint()
+            if hasattr(view, "renderWindow"):
+                view.renderWindow().Render()
+        self._setDetails("3D 对比已显示\n人工标注：绿色\n模型预测：蓝色\n相机：已对准两者联合可见范围")
+        return True
+
+    def _exportCurrentExperiment(self):
+        if not self._resultRunDir:
+            self._setStatusMessage("只有已归档的真实实验可以导出；当前没有实验记录。", "warning")
+            return False
+        selected = qt.QFileDialog.getExistingDirectory(
+            slicer.util.mainWindow(), "选择实验导出目录", str(self.projectRoot / "workspace")
+        )
+        if not selected:
+            return False
+        destination = Path(selected) / "experiment_export"
+        try:
+            export_experiment_results(self._resultRunDir, destination=destination)
+            screenshots = self._captureExperimentScreenshots(destination)
+            self._setStatusMessage(f"实验结果已导出到：{destination}", "success")
+            screenshotText = (
+                "\n匿名可视化截图：" + ", ".join(str(path.name) for path in screenshots)
+                if screenshots
+                else "\n当前没有已加载的 GT / Prediction 对比，未生成可视化截图；先选择病例并查看对比后再导出。"
+            )
+            self._setDetails(f"实验导出完成\n目录：{destination}{screenshotText}")
+            return True
+        except Exception:
+            self._setDetails("导出实验结果失败\n" + traceback.format_exc())
+            self._setStatusMessage("导出没有完成，请查看高级信息。", "warning")
+            return False
+
+    def _captureExperimentScreenshots(self, destination):
+        """Capture only anonymous platform views when a comparison is loaded."""
+
+        if not self._resultCompareSegmentationNode or not hasattr(slicer.util, "saveScreenshot"):
+            return []
+        screenshotsDir = Path(destination) / "screenshots"
+        screenshotsDir.mkdir(parents=True, exist_ok=True)
+        saved = []
+        manager = slicer.app.layoutManager()
+        try:
+            self._showResult2D()
+            primaryName = next(iter(manager.sliceViewNames()), None)
+            if primaryName:
+                sliceWidget = manager.sliceWidget(primaryName)
+                sliceView = sliceWidget.sliceView() if sliceWidget else None
+                if sliceView:
+                    path = screenshotsDir / "gt_prediction_slice.png"
+                    slicer.util.saveScreenshot(str(path), sliceView)
+                    if path.is_file():
+                        saved.append(path)
+        except Exception:
+            pass
+        try:
+            self._showResult3D()
+            threeDCount = getattr(manager, "threeDViewCount", 0)
+            if callable(threeDCount):
+                threeDCount = threeDCount()
+            if int(threeDCount) > 0:
+                view = manager.threeDWidget(0).threeDView()
+                path = screenshotsDir / "gt_prediction_3d.png"
+                slicer.util.saveScreenshot(str(path), view)
+                if path.is_file():
+                    saved.append(path)
+        except Exception:
+            pass
+        return saved
+
+    # ------------------------------------------------------------------
+    # New-case prediction
+    # ------------------------------------------------------------------
+    def _refreshPredictionPage(self):
+        if not hasattr(self, "predictionModelLabel"):
+            return
+        states = detect_fold_states(
+            fold_results_directory(results_root=self.projectRoot / "workspace" / "nnUNet_results")
+        )
+        modelReady = all(state.completed for state in states)
+        if modelReady:
+            self.predictionModelLabel.setText("✓ 五折训练模型已准备好")
+            self.predictionModelHintLabel.setText("将使用 fold 0–4 ensemble 预测新病例。")
+        else:
+            self.predictionModelLabel.setText("当前还没有完整的五折训练模型")
+            done = len([state for state in states if state.completed])
+            self.predictionModelHintLabel.setText(
+                f"已完成 {done} / {len(states)} 组。请先完成正式训练，再使用自动分割。"
+            )
+        hasInput = bool(self._predictionInputPath and Path(self._predictionInputPath).exists())
+        hasOutput = prediction_result_ready(self._predictionOutputPath)
+        running = self._process is not None
+        self.startPredictionButton.setEnabled(modelReady and hasInput and not running)
+        self.selectPredictionButton.setEnabled(not running)
+        self.viewPrediction2DButton.setEnabled(hasOutput and bool(self._predictionSegmentationNode))
+        self.viewPrediction3DButton.setEnabled(hasOutput and bool(self._predictionSegmentationNode))
+        self.exportPredictionButton.setEnabled(hasOutput)
+
+    def _choosePredictionInput(self):
+        selected = self._dialogPath(
+            qt.QFileDialog.getOpenFileName(
+                slicer.util.mainWindow(),
+                "选择新的 MRI",
+                str(self.projectRoot / "workspace" / "nifti"),
+                "核磁文件 (*.nii.gz *.nii *.nrrd);;所有文件 (*)",
+            )
+        )
+        if not selected:
+            return False
+        self._predictionInputPath = Path(selected).resolve()
+        caseStem = self._stripImageSuffix(self._predictionInputPath)
+        self._predictionOutputPath = (
+            self.projectRoot / "workspace" / "predictions" / f"{caseStem}_condyle.nii.gz"
+        ).resolve()
+        self.predictionInputLabel.setText(str(self._predictionInputPath))
+        self.predictionStatusLabel.setText("MRI 已选择，可以开始自动分割。")
+        self._refreshPredictionPage()
+        return True
+
+    def _startPrediction(self):
+        if not self._predictionInputPath or not Path(self._predictionInputPath).exists():
+            self._setStatusMessage("请先选择新的 MRI。", "warning")
+            return False
+        self._refreshPredictionPage()
+        if not self.startPredictionButton.isEnabled():
+            self._setStatusMessage("需要完整五折模型和可用的输入 MRI 才能自动分割。", "warning")
+            return False
+        self.predictionLogWidget.clear()
+        self.predictionStatusLabel.setText("正在调用五折 nnU-Net ensemble，请稍候…")
+        command = prediction_command(
+            self._predictionInputPath,
+            self._predictionOutputPath,
+            device="cuda",
+            project_root=self.projectRoot,
+            python_executable=project_python_executable(self.projectRoot),
+        )
+        return self._startExternalProcess("prediction", command)
+
+    def _finishPrediction(self, exitCode):
+        if exitCode != 0 or not prediction_result_ready(self._predictionOutputPath):
+            self.predictionStatusLabel.setText("自动分割没有完成，未加载不存在的预测结果。")
+            self._setStatusMessage("自动分割失败，请查看详细日志。", "warning")
+            return
+        try:
+            self._loadPredictionResult()
+            self.predictionStatusLabel.setText("自动分割完成 ✓ 已生成预测 mask，可以查看切片或 3D。")
+            self._setStatusMessage("自动分割完成。", "success")
+        except Exception:
+            self._setDetails("显示预测结果失败\n" + traceback.format_exc())
+            self.predictionStatusLabel.setText("预测文件已生成，但 3D Slicer 没有成功显示。")
+            self._setStatusMessage("预测文件存在，但显示没有完成。", "warning")
+        self._refreshPredictionPage()
+
+    def _loadPredictionResult(self):
+        if not self._predictionInputPath or not self._predictionOutputPath:
+            raise RuntimeError("prediction paths are empty")
+        self._removeNodeSafely(getattr(self, "_predictionImageNode", None))
+        self._removeNodeSafely(self._predictionLabelNode)
+        self._removeNodeSafely(self._predictionSegmentationNode)
+        loaded = slicer.util.loadVolume(str(self._predictionInputPath), returnNode=True)
+        self._predictionImageNode = loaded[1] if isinstance(loaded, tuple) else loaded
+        labelLoaded = slicer.util.loadLabelVolume(str(self._predictionOutputPath), returnNode=True)
+        labelNode = labelLoaded[1] if isinstance(labelLoaded, tuple) else labelLoaded
+        if not self._predictionImageNode or not labelNode:
+            raise RuntimeError("Slicer could not load prediction pair")
+        seg = self._segmentationFromLabel(
+            self._predictionImageNode,
+            labelNode,
+            "TMJ_Prediction",
+            "自动预测",
+            (0.1, 0.4, 0.95),
+        )
+        self._predictionSegmentationNode = seg
+        self._predictionLabelNode = None
+        self._showVolumeInSliceViews(self._predictionImageNode)
+        self._showPrediction2D()
+
+    def _segmentationFromLabel(self, imageNode, labelNode, nodeName, segmentName, color):
+        seg = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", nodeName)
+        seg.CreateDefaultDisplayNodes()
+        seg.SetReferenceImageGeometryParameterFromVolumeNode(imageNode)
+        imported = slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(labelNode, seg)
+        self._removeNodeSafely(labelNode)
+        if imported is False or seg.GetSegmentation().GetNumberOfSegments() < 1:
+            self._removeNodeSafely(seg)
+            raise RuntimeError("prediction label is empty or could not be imported")
+        segmentId = seg.GetSegmentation().GetNthSegmentID(0)
+        segment = seg.GetSegmentation().GetSegment(segmentId)
+        segment.SetName(segmentName)
+        segment.SetColor(*color)
+        display = seg.GetDisplayNode()
+        if display:
+            display.SetVisibility(True)
+            if hasattr(display, "SetOpacity"):
+                display.SetOpacity(0.55)
+            if hasattr(display, "SetOpacity3D"):
+                display.SetOpacity3D(0.8)
+            if hasattr(display, "SetSegmentVisibility"):
+                display.SetSegmentVisibility(segmentId, True)
+            if hasattr(display, "SetSegmentVisibility3D"):
+                display.SetSegmentVisibility3D(segmentId, True)
+        return seg
+
+    def _showPrediction2D(self):
+        if not self._predictionSegmentationNode or not getattr(self, "_predictionImageNode", None):
+            return False
+        self._setCheckLayout()
+        self._showVolumeInSliceViews(self._predictionImageNode)
+        return True
+
+    def _showPrediction3D(self):
+        seg = self._predictionSegmentationNode
+        if not seg:
+            return False
+        seg.CreateClosedSurfaceRepresentation()
+        self._setCheckLayout()
+        display = seg.GetDisplayNode()
+        if display and hasattr(display, "SetVisibility3D"):
+            display.SetVisibility3D(True)
+        manager = slicer.app.layoutManager()
+        threeDCount = getattr(manager, "threeDViewCount", 0)
+        if callable(threeDCount):
+            threeDCount = threeDCount()
+        self._showVolumeInSliceViews(self._predictionImageNode)
+        if int(threeDCount) > 0:
+            view = manager.threeDWidget(0).threeDView()
+            view.show()
+            if hasattr(view, "resetCamera"):
+                view.resetCamera()
+            if hasattr(view, "resetFocalPoint"):
+                view.resetFocalPoint()
+            if hasattr(view, "renderWindow"):
+                view.renderWindow().Render()
+        self._setStatusMessage("预测髁突 3D 已显示，相机已自动对准模型。", "success")
+        return True
+
+    def _onPredictionOpacityChanged(self, value):
+        self.predictionOpacityLabel.setText(f"{int(value)}%")
+        display = self._predictionSegmentationNode.GetDisplayNode() if self._predictionSegmentationNode else None
+        if display:
+            opacity = float(value) / 100.0
+            try:
+                display.SetOpacity(opacity)
+                if hasattr(display, "SetOpacity3D"):
+                    display.SetOpacity3D(min(0.95, opacity + 0.2))
+            except Exception:
+                pass
+
+    def _exportPrediction(self):
+        if not prediction_result_ready(self._predictionOutputPath):
+            self._setStatusMessage("当前没有可以导出的预测 mask。", "warning")
+            return False
+        selected = self._dialogPath(
+            qt.QFileDialog.getSaveFileName(
+                slicer.util.mainWindow(),
+                "导出预测 mask",
+                str(self._predictionOutputPath),
+                "NIfTI mask (*.nii.gz);;所有文件 (*)",
+            )
+        )
+        if not selected:
+            return False
+        destination = Path(selected)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self._predictionOutputPath, destination)
+        self._setStatusMessage(f"预测 mask 已导出：{destination}", "success")
+        return True
+
+    def _showTrainingLogDialog(self):
+        textValue = self._processOutput
+        if self._currentRunDir:
+            logPath = self._currentRunDir / "logs" / "training.log"
+            if logPath.exists():
+                try:
+                    textValue = logPath.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
+        dialog = qt.QDialog(slicer.util.mainWindow())
+        dialog.setWindowTitle("详细日志")
+        dialog.setMinimumSize(820, 520)
+        dialogLayout = qt.QVBoxLayout(dialog)
+        log = qt.QPlainTextEdit()
+        log.setReadOnly(True)
+        log.setPlainText(textValue or "暂无日志。")
+        dialogLayout.addWidget(log)
+        close = self._secondaryButton("关闭")
+        close.clicked.connect(lambda checked=False: dialog.accept())
+        dialogLayout.addWidget(close, 0, qt.Qt.AlignRight)
+        self._execDialog(dialog)
+
+    def _showSettingsAdvanced(self):
+        self.advancedToggle.setChecked(True)
+        self._showDetailsDialog()
+
+    def _refreshSettingsPage(self):
+        if not hasattr(self, "settingsPythonLabel"):
+            return
+        self.settingsPythonLabel.setText(project_python_executable(self.projectRoot))
+        self.settingsDatasetLabel.setText(
+            str(self.projectRoot / "workspace" / "nnUNet_raw" / "Dataset501_CondyleMRI")
+        )
+        self.settingsWorkspaceLabel.setText(str(self.projectRoot / "workspace"))
 
     # ------------------------------------------------------------------
     # Module lifecycle and embedded editor
@@ -1324,18 +3320,25 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
     def _showUsageGuide(self):
         dialog = qt.QDialog(slicer.util.mainWindow())
         dialog.setWindowTitle("使用帮助")
-        dialog.setMinimumWidth(440)
+        dialog.setMinimumSize(520, 460)
         dialog.setStyleSheet(self._styleSheet())
         layout = qt.QVBoxLayout(dialog)
-        title = qt.QLabel("只需要四步")
+        title = qt.QLabel("怎么做一次完整实验？")
         title.setObjectName("pageTitle")
         layout.addWidget(title)
         text = qt.QLabel(
-            "1. 选择核磁\n"
-            "2. 用画笔把髁突涂出来，涂错就用擦除\n"
-            "3. 每一层都检查，再看一下三维效果\n"
-            "4. 保存本例，继续下一例\n\n"
-            "标好的病例以后会用于训练电脑自动识别下颌髁突。"
+            "完成一次实验只需要下面几步：\n\n"
+            "1. 导入核磁病例\n"
+            "2. 把下颌髁突标出来并保存\n"
+            "3. 准备至少几例已标注病例\n"
+            "4. 在“训练数据”中检查并准备训练数据\n"
+            "5. 在“模型训练”中开始 5 组交叉验证\n"
+            "6. 等待 5 组实验完成\n"
+            "7. 在“实验结果”中查看 Dice、IoU 和 HD95\n"
+            "8. 选择病例查看人工标注与自动预测的 2D / 3D 对比\n"
+            "9. 在“自动分割”中用新的 MRI 测试模型\n\n"
+            "系统只显示真实训练和评价结果；没有足够病例或兼容 CUDA 显卡时，"
+            "会明确提示原因，不会生成假指标。"
         )
         text.setObjectName("mutedLabel")
         text.setWordWrap(True)
@@ -1535,6 +3538,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             return False
         self._currentPage = index
         self._homeVisible = False
+        self._mainPage = "cases"
         self.pageStack.setCurrentIndex(index + 1)
         if index == 1:
             self._setAnnotationLayout()
@@ -1553,8 +3557,11 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         if self._dirty and not self._confirmUnsaved():
             return False
         self._homeVisible = True
-        self.pageStack.setCurrentIndex(0)
-        self._setStatusMessage("欢迎使用。可以开始新的标注或查看病例进度。", "info")
+        self._mainPage = "home"
+        self.pageStack.setCurrentIndex(PAGE_HOME)
+        self._restoreWorkflowLayout()
+        self._setStatusMessage("欢迎使用。首页会根据当前状态告诉你下一步做什么。", "info")
+        self._updatePageChrome()
         self._syncUi()
         return True
 
@@ -1684,7 +3691,9 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
     def _setPageForCheck(self):
         self._currentPage = 2
         self._homeVisible = False
-        self.pageStack.setCurrentIndex(3)
+        self._mainPage = "cases"
+        self.pageStack.setCurrentIndex(PAGE_CASE_CHECK)
+        self._updatePageChrome()
         self._setCheckLayout()
         self._removeViewObservations()
         self._setResultMessage(
@@ -1792,6 +3801,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         elif self._caseFiles:
             self._currentCaseIndex = 0
             self._currentCaseId = self._caseIdForIndex(self._caseFiles[0], 0)
+        self._refreshCaseListWidget()
 
     def _refreshLoadedVolumes(self):
         if not hasattr(self, "loadedVolumeSelector"):
@@ -1968,7 +3978,9 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self._threeDVisible = False
         self._surfacePointCount = 0
         self._surfaceCellCount = 0
-        self.pageStack.setCurrentIndex(1)
+        self._mainPage = "cases"
+        self.pageStack.setCurrentIndex(PAGE_CASE_IMPORT)
+        self._updatePageChrome()
         self.saveSuccessLabel.setVisible(False)
         self.saveResultLabel.clear()
         self.saveNextGuidanceLabel.clear()
@@ -3233,6 +5245,24 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self._setStatusMessage("当前已经是最后一个病例。", "info")
 
     def cleanup(self):
+        if self._process is not None:
+            try:
+                self._process.kill()
+            except Exception:
+                pass
+            self._process = None
+        if self._taskTimer is not None:
+            try:
+                self._taskTimer.stop()
+            except Exception:
+                pass
+        self._clearResultComparison()
+        self._removeNodeSafely(getattr(self, "_predictionImageNode", None))
+        self._removeNodeSafely(self._predictionLabelNode)
+        self._removeNodeSafely(self._predictionSegmentationNode)
+        self._predictionLabelNode = None
+        self._predictionSegmentationNode = None
+        self._predictionImageNode = None
         if self._mainWindow:
             try:
                 self._mainWindow.removeEventFilter(self)
@@ -3327,19 +5357,36 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.caseNavigationLabel.setText("病例 " + progress)
 
         if hasattr(self, "homeProgressLabel"):
-            completed = sum(
-                self._caseStatusForIndex(index) == "已完成"
-                for index in range(len(self._caseFiles))
-            )
-            total = len(self._caseFiles)
+            inventory, counts = self._inventoryAndCounts()
+            completed = int(counts["annotated"])
+            total = int(counts["total"])
             self.homeProgressLabel.setText(
                 f"病例进度：{total} 个病例　　已完成：{completed}　　未完成：{total - completed}"
                 if total
                 else "还没有导入病例。"
             )
-            self.homeContinueButton.setEnabled(bool(self.volumeNode or self._caseFiles))
+            self.homeStartButton.setEnabled(bool(self.volumeNode or self._caseFiles))
+            self.homeContinueButton.setEnabled(True)
             self.homeProgressButton.setEnabled(bool(self._caseFiles))
-            self.homeAnnotatedButton.setEnabled(completed > 0)
+            self.homeAnnotatedButton.setEnabled(True)
+            self.homeTrainingButton.setEnabled(True)
+            self.homeResultsButton.setEnabled(True)
+            self.homePredictButton.setEnabled(True)
+            self.homeStatLabels["total"].setText(str(total))
+            self.homeStatLabels["annotated"].setText(str(completed))
+            self.homeStatLabels["trainable"].setText(str(counts["trainable"]))
+            self.homeStatLabels["training"].setText(
+                "进行中" if self._processKind in {"training", "oof", "evaluation"}
+                else "已完成" if all(state.completed for state in detect_fold_states(fold_results_directory(results_root=self.projectRoot / "workspace" / "nnUNet_results")))
+                else "未开始"
+            )
+            self.homeStatLabels["results"].setText(
+                "可查看" if has_evaluation_results(self.projectRoot / "workspace" / "reports") or list_experiment_runs(self.projectRoot / "workspace") else "暂无"
+            )
+            self.homeStatLabels["model"].setText(
+                "已准备" if all(state.completed for state in detect_fold_states(fold_results_directory(results_root=self.projectRoot / "workspace" / "nnUNet_results"))) else "暂无"
+            )
+            self.homeNextStepLabel.setText(self._homeNextStep(counts))
 
         statusState = "complete" if status == "已完成" else "working" if status == "标注中" else ""
         statusPrefix = "✓ " if status == "已完成" else "● "
@@ -3400,6 +5447,24 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self._setToolButtonState()
         self._updateSliceLabel()
         self._updateSaveSummary()
+        self._refreshCaseListWidget()
+        self._updatePageChrome()
+        if self._mainPage == "prediction":
+            self._refreshPredictionPage()
+
+    def _homeNextStep(self, counts):
+        states = detect_fold_states(
+            fold_results_directory(results_root=self.projectRoot / "workspace" / "nnUNet_results")
+        )
+        return home_next_step(
+            total_cases=int(counts.get("total", 0)),
+            annotated_cases=int(counts.get("annotated", 0)),
+            validation_passed=self._validationPassed,
+            dataset_prepared=self._datasetPrepared,
+            training_active=self._processKind in {"training", "oof", "evaluation"},
+            model_ready=all(state.completed for state in states),
+            results_ready=has_evaluation_results(self.projectRoot / "workspace" / "reports"),
+        )
 
     def _updateSaveSummary(self):
         if not hasattr(self, "saveSummaryLabel"):

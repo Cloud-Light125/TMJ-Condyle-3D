@@ -24,7 +24,7 @@ $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $launcherPath
 $shortcut.WorkingDirectory = $projectRoot
-$shortcut.Description = 'TMJ Condyle annotation workbench'
+$shortcut.Description = 'TMJ Condyle 3D segmentation experiment platform'
 $shortcut.IconLocation = "$launcherPath,0"
 $shortcut.Save()
 

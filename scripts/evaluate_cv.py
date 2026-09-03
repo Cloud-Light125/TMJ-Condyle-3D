@@ -68,6 +68,23 @@ def _write_metric_figure(summary: list[dict[str, object]], path: Path) -> None:
     ax.grid(axis="y", alpha=0.25)
     fig.savefig(path, dpi=160, bbox_inches="tight")
     plt.close(fig)
+    # Keep individual charts as well as the combined chart so a student can
+    # drop the three requested figures directly into a course report.
+    for metric, color in zip(
+        ("dice", "iou", "hd95_mm"), ("#d97706", "#0f766e", "#2563eb")
+    ):
+        row = next((item for item in summary if item["metric"] == metric), None)
+        if row is None:
+            continue
+        mean = float(row["mean"]) if math.isfinite(float(row["mean"])) else 0.0
+        std = float(row["std"]) if math.isfinite(float(row["std"])) else 0.0
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.bar([metric], [mean], yerr=[std], capsize=4, color=color)
+        ax.set_title(metric.upper() if metric != "hd95_mm" else "HD95")
+        ax.set_ylabel("mm" if metric == "hd95_mm" else "score")
+        ax.grid(axis="y", alpha=0.25)
+        fig.savefig(path.with_name(f"figure_{metric}.png"), dpi=160, bbox_inches="tight")
+        plt.close(fig)
 
 
 def main() -> int:
