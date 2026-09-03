@@ -119,10 +119,16 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self._currentCasePath = None
         self._currentCaseIndex = 0
         self._caseFiles = []
+        self._batchCaseFiles = None
+        self._batchCaseIds = {}
         self._lastDetailText = ""
         self._currentPage = 0
+        self._homeVisible = True
         self._primaryAxis = 2
         self._primaryOrientation = "Axial"
+        self._threeDVisible = False
+        self._surfacePointCount = 0
+        self._surfaceCellCount = 0
 
         self._simpleMode = False
         self._simpleModeTargets = []
@@ -143,7 +149,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         # panels just after a scripted module is constructed.  Re-apply the
         # temporary simple-mode filter once the main window is settled.
         qt.QTimer.singleShot(800, lambda: self._setSimpleMode(True))
-        self._setStatusMessage("请先选择一份需要标注的 MRI。", "info")
+        self._setStatusMessage("欢迎使用。点击“开始新的标注”选择病例。", "info")
         self._syncUi()
 
     # ------------------------------------------------------------------
@@ -219,6 +225,48 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
           color: #163b57;
           font-size: 14px;
           font-weight: 600;
+        }
+        QLabel#homeLead {
+          color: #163b57;
+          font-size: 16px;
+          font-weight: 600;
+        }
+        QLabel#homePurpose {
+          color: #526777;
+          font-size: 13px;
+          line-height: 1.5;
+        }
+        QLabel#homeProgress {
+          color: #28546a;
+          font-size: 13px;
+          font-weight: 600;
+          padding: 8px 0;
+        }
+        QPushButton#homeCardButton {
+          background: #ffffff;
+          color: #28546a;
+          border: 1px solid #c8dbe2;
+          border-radius: 12px;
+          min-height: 58px;
+          padding: 0 14px;
+          font-size: 14px;
+          font-weight: 600;
+          text-align: left;
+        }
+        QPushButton#homeCardButton:hover {
+          background: #f2f8fa;
+          border-color: #8dbbc7;
+        }
+        QPushButton#homeCardButton:disabled {
+          color: #a6b4bc;
+          border-color: #e1e8ec;
+          background: #fafbfc;
+        }
+        QLabel#viewHint {
+          color: #526777;
+          background: #eef6fb;
+          border-radius: 10px;
+          padding: 10px 12px;
         }
         QLabel#statusChip {
           background: #eef2f5;
@@ -404,6 +452,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
 
         self.pageStack = qt.QStackedWidget()
         self.pageStack.setObjectName("workflowPages")
+        self.pageStack.addWidget(self._buildHomePage())
         self.pageStack.addWidget(self._buildImportPage())
         self.pageStack.addWidget(self._buildAnnotationPage())
         self.pageStack.addWidget(self._buildCheckPage())
@@ -444,17 +493,20 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.titleLabel = qt.QLabel("下颌髁突三维标注")
         self.titleLabel.setObjectName("mainTitle")
         brand.addWidget(self.titleLabel)
-        self.subtitleLabel = qt.QLabel("TMJ MRI · 人工标注")
+        self.subtitleLabel = qt.QLabel("核磁标注与三维查看")
         self.subtitleLabel.setObjectName("subtitleLabel")
         brand.addWidget(self.subtitleLabel)
         row.addLayout(brand, 1)
 
         right = qt.QVBoxLayout()
         actionRow = qt.QHBoxLayout()
+        self.homeButton = self._linkButton("首页")
+        self.homeButton.clicked.connect(self._goHome)
+        actionRow.addWidget(self.homeButton)
         self.helpButton = self._linkButton("？ 使用帮助")
         self.helpButton.clicked.connect(self._showUsageGuide)
         actionRow.addWidget(self.helpButton)
-        self.simpleModeButton = self._linkButton("退出简洁模式")
+        self.simpleModeButton = self._linkButton("显示完整 Slicer")
         self.simpleModeButton.clicked.connect(self._toggleSimpleMode)
         actionRow.addWidget(self.simpleModeButton)
         right.addLayout(actionRow)
@@ -523,6 +575,82 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         layout.addLayout(row)
         mainLayout.addWidget(card)
 
+    def _buildHomePage(self):
+        page = self._card("contentCard")
+        layout = qt.QVBoxLayout(page)
+        layout.setContentsMargins(22, 22, 22, 22)
+        welcome = qt.QLabel("欢迎使用")
+        welcome.setObjectName("pageEyebrow")
+        layout.addWidget(welcome)
+        title = qt.QLabel("下颌髁突三维标注")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+        subtitle = qt.QLabel(
+            "给核磁中的下颌髁突做标记，为后续自动分割训练准备数据。"
+        )
+        subtitle.setObjectName("mutedLabel")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        lead = qt.QLabel("你现在做的事情很简单：")
+        lead.setObjectName("homeLead")
+        layout.addWidget(lead)
+        purpose = qt.QLabel(
+            "先告诉电脑哪些地方是下颌髁突。\n"
+            "等标好一批病例后，这些标注会用来训练电脑。\n"
+            "训练完成后，以后的新核磁就可以自动把髁突分出来，并显示成三维模型。"
+        )
+        purpose.setObjectName("homePurpose")
+        purpose.setWordWrap(True)
+        layout.addWidget(purpose)
+
+        self.homeProgressLabel = qt.QLabel()
+        self.homeProgressLabel.setObjectName("homeProgress")
+        self.homeProgressLabel.setWordWrap(True)
+        layout.addWidget(self.homeProgressLabel)
+
+        cards = qt.QGridLayout()
+        cards.setHorizontalSpacing(10)
+        cards.setVerticalSpacing(10)
+        self.homeStartButton = self._homeCardButton("开始新的标注")
+        self.homeStartButton.clicked.connect(self._startNewAnnotationFromHome)
+        cards.addWidget(self.homeStartButton, 0, 0)
+        self.homeContinueButton = self._homeCardButton("继续上次标注")
+        self.homeContinueButton.clicked.connect(self._continueLastAnnotation)
+        cards.addWidget(self.homeContinueButton, 0, 1)
+        self.homeProgressButton = self._homeCardButton("查看标注进度")
+        self.homeProgressButton.clicked.connect(self._showProgressDialog)
+        cards.addWidget(self.homeProgressButton, 1, 0)
+        self.homeAnnotatedButton = self._homeCardButton("查看已标注病例")
+        self.homeAnnotatedButton.clicked.connect(
+            lambda checked=False: self._showProgressDialog(onlyCompleted=True)
+        )
+        cards.addWidget(self.homeAnnotatedButton, 1, 1)
+        self.homeHelpButton = self._homeCardButton("使用说明")
+        self.homeHelpButton.clicked.connect(self._showUsageGuide)
+        cards.addWidget(self.homeHelpButton, 2, 0, 1, 2)
+        layout.addLayout(cards)
+
+        processCard = self._card("hintCard")
+        processLayout = qt.QVBoxLayout(processCard)
+        processLayout.setContentsMargins(14, 12, 14, 12)
+        processTitle = qt.QLabel("使用流程")
+        processTitle.setObjectName("sectionTitle")
+        processLayout.addWidget(processTitle)
+        process = qt.QLabel("① 导入核磁　② 标出髁突　③ 检查三维结果　④ 保存")
+        process.setObjectName("hintLabel")
+        process.setWordWrap(True)
+        processLayout.addWidget(process)
+        layout.addWidget(processCard)
+        layout.addStretch(1)
+        return page
+
+    @staticmethod
+    def _homeCardButton(text):
+        button = qt.QPushButton(text)
+        button.setObjectName("homeCardButton")
+        return button
+
     def _buildImportPage(self):
         page = self._card("contentCard")
         layout = qt.QVBoxLayout(page)
@@ -530,12 +658,12 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self._addPageHeader(
             layout,
             "第 1 步",
-            "导入核磁",
-            "选择一份需要标注的颞下颌关节 MRI。",
+            "选择病例",
+            "选择一份需要标注的核磁，或一次导入一个病例文件夹。",
         )
 
         self.importLoadedRow = qt.QHBoxLayout()
-        loadedCaption = qt.QLabel("已加载病例")
+        loadedCaption = qt.QLabel("当前已加载")
         loadedCaption.setObjectName("mutedLabel")
         self.importLoadedRow.addWidget(loadedCaption)
         self.loadedVolumeSelector = qt.QComboBox()
@@ -546,10 +674,13 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         layout.addLayout(self.importLoadedRow)
 
         buttonRow = qt.QHBoxLayout()
-        self.loadButton = self._primaryButton("选择 MRI")
+        self.loadButton = self._primaryButton("选择核磁文件")
         self.loadButton.clicked.connect(self._chooseAndLoadVolume)
         buttonRow.addWidget(self.loadButton)
-        self.useCurrentButton = self._secondaryButton("使用当前病例")
+        self.folderButton = self._secondaryButton("导入病例文件夹")
+        self.folderButton.clicked.connect(self._chooseAndLoadFolder)
+        buttonRow.addWidget(self.folderButton)
+        self.useCurrentButton = self._secondaryButton("继续当前病例")
         self.useCurrentButton.clicked.connect(self._useSelectedLoadedVolume)
         buttonRow.addWidget(self.useCurrentButton)
         layout.addLayout(buttonRow)
@@ -559,7 +690,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.importResultLabel.setWordWrap(True)
         layout.addWidget(self.importResultLabel)
 
-        self.importNextButton = self._primaryButton("下一步：开始标注")
+        self.importNextButton = self._primaryButton("下一步：标注髁突")
         self.importNextButton.clicked.connect(self._startAnnotation)
         layout.addWidget(self.importNextButton)
 
@@ -585,8 +716,8 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self._addPageHeader(
             layout,
             "第 2 步",
-            "标注下颌髁突",
-            "把图像里的下颌髁突涂出来。建议从第一层检查到最后一层。",
+            "标注髁突",
+            "用画笔把图像里的下颌髁突涂出来。建议从第一层检查到最后一层。",
         )
 
         self.firstHintCard = self._card("hintCard")
@@ -609,7 +740,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         toolTitle.setObjectName("sectionTitle")
         toolTitleRow.addWidget(toolTitle)
         toolTitleRow.addStretch(1)
-        self.currentToolLabel = qt.QLabel("当前：画笔")
+        self.currentToolLabel = qt.QLabel("正在使用：画笔")
         self.currentToolLabel.setObjectName("mutedLabel")
         toolTitleRow.addWidget(self.currentToolLabel)
         layout.addLayout(toolTitleRow)
@@ -660,6 +791,13 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         sliceLayout.addLayout(sliceButtons)
         layout.addWidget(sliceCard)
 
+        self.sliceSuggestionLabel = qt.QLabel(
+            "建议从第一层检查到最后一层，确保每一层都没有漏标。"
+        )
+        self.sliceSuggestionLabel.setObjectName("hintLabel")
+        self.sliceSuggestionLabel.setWordWrap(True)
+        layout.addWidget(self.sliceSuggestionLabel)
+
         opacityRow = qt.QHBoxLayout()
         opacityCaption = qt.QLabel("标注透明度")
         opacityCaption.setObjectName("mutedLabel")
@@ -698,7 +836,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.annotationMessageLabel.setWordWrap(True)
         layout.addWidget(self.annotationMessageLabel)
 
-        self.annotateNextButton = self._primaryButton("标完了，下一步：检查")
+        self.annotateNextButton = self._primaryButton("标完了，检查三维")
         self.annotateNextButton.clicked.connect(self._goToCheck)
         layout.addWidget(self.annotateNextButton)
 
@@ -721,8 +859,8 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self._addPageHeader(
             layout,
             "第 3 步",
-            "检查标注",
-            "从不同方向和三维视图检查有没有漏标或误标。这里只做技术检查，不判断医学是否正确。",
+            "检查三维结果",
+            "这是你刚才标出的下颌髁突三维形状。转动查看有没有缺一块、多出小块，整体是否连续。",
         )
 
         checkCard = self._card("hintCard")
@@ -730,22 +868,45 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         checkLayout.setContentsMargins(13, 11, 13, 11)
         self.checkListLabel = qt.QLabel(
             "请检查：\n"
-            "✓ 三个方向的轮廓是否连续\n"
-            "✓ 有没有明显漏标或涂到周围组织\n"
-            "✓ 三维形状是否存在远处的小块"
+            "• 有没有明显缺一块\n"
+            "• 有没有多出奇怪的小块\n"
+            "• 整体形状是否连续"
         )
         self.checkListLabel.setObjectName("hintLabel")
         self.checkListLabel.setWordWrap(True)
         checkLayout.addWidget(self.checkListLabel)
         buttonRow = qt.QHBoxLayout()
-        self.show3DButton = self._primaryButton("显示三维髁突")
+        self.show3DButton = self._primaryButton("检查三维效果")
         self.show3DButton.clicked.connect(self._show3D)
         buttonRow.addWidget(self.show3DButton)
+        self.redisplay3DButton = self._secondaryButton("重新显示 3D")
+        self.redisplay3DButton.clicked.connect(self._show3D)
+        buttonRow.addWidget(self.redisplay3DButton)
         self.checkButton = self._secondaryButton("检查标注")
         self.checkButton.clicked.connect(self._checkAnnotation)
         buttonRow.addWidget(self.checkButton)
         checkLayout.addLayout(buttonRow)
         layout.addWidget(checkCard)
+
+        viewSwitchRow = qt.QHBoxLayout()
+        viewLabel = qt.QLabel("查看方式")
+        viewLabel.setObjectName("sectionTitle")
+        viewSwitchRow.addWidget(viewLabel)
+        self.view2DButton = self._secondaryButton("看切片")
+        self.view2DButton.clicked.connect(self._show2DCheckView)
+        viewSwitchRow.addWidget(self.view2DButton)
+        self.view3DButton = self._secondaryButton("看三维")
+        self.view3DButton.clicked.connect(self._show3D)
+        viewSwitchRow.addWidget(self.view3DButton)
+        viewSwitchRow.addStretch(1)
+        layout.addLayout(viewSwitchRow)
+
+        self.threeDHintLabel = qt.QLabel(
+            "鼠标左键拖动：旋转　　鼠标滚轮：放大 / 缩小"
+        )
+        self.threeDHintLabel.setObjectName("viewHint")
+        self.threeDHintLabel.setWordWrap(True)
+        layout.addWidget(self.threeDHintLabel)
 
         self.qcResultLabel = qt.QLabel()
         self.qcResultLabel.setObjectName("resultMessage")
@@ -753,11 +914,11 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         layout.addWidget(self.qcResultLabel)
 
         checkNavigation = qt.QHBoxLayout()
-        self.backToAnnotationButton = self._secondaryButton("返回继续修改")
+        self.backToAnnotationButton = self._secondaryButton("返回修改标注")
         self.backToAnnotationButton.clicked.connect(self._returnToAnnotation)
         checkNavigation.addWidget(self.backToAnnotationButton)
         checkNavigation.addStretch(1)
-        self.confirmCheckButton = self._primaryButton("确认无误，下一步保存")
+        self.confirmCheckButton = self._primaryButton("没问题，下一步保存")
         self.confirmCheckButton.clicked.connect(self._goToSave)
         checkNavigation.addWidget(self.confirmCheckButton)
         layout.addLayout(checkNavigation)
@@ -772,7 +933,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             layout,
             "第 4 步",
             "保存本例",
-            "确认病例信息和技术检查结果后，保存本例的下颌髁突 Mask。",
+            "确认检查完成后，保存本例的标注结果。",
         )
 
         self.saveSummaryLabel = qt.QLabel()
@@ -781,7 +942,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.saveSummaryLabel.setMargin(14)
         layout.addWidget(self.saveSummaryLabel)
 
-        self.saveButton = self._primaryButton("保存本例标注")
+        self.saveButton = self._primaryButton("保存本例")
         self.saveButton.clicked.connect(self._saveAnnotation)
         layout.addWidget(self.saveButton)
 
@@ -789,18 +950,23 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.saveResultLabel.setObjectName("resultMessage")
         self.saveResultLabel.setWordWrap(True)
         layout.addWidget(self.saveResultLabel)
-        self.saveSuccessLabel = qt.QLabel("保存成功")
+        self.saveSuccessLabel = qt.QLabel()
         self.saveSuccessLabel.setObjectName("bigSuccess")
         self.saveSuccessLabel.setAlignment(qt.Qt.AlignCenter)
         self.saveSuccessLabel.setVisible(False)
         layout.addWidget(self.saveSuccessLabel)
+
+        self.saveNextGuidanceLabel = qt.QLabel()
+        self.saveNextGuidanceLabel.setObjectName("resultMessage")
+        self.saveNextGuidanceLabel.setWordWrap(True)
+        layout.addWidget(self.saveNextGuidanceLabel)
 
         saveNavigation = qt.QHBoxLayout()
         self.backToCheckButton = self._secondaryButton("返回检查")
         self.backToCheckButton.clicked.connect(self._returnToCheck)
         saveNavigation.addWidget(self.backToCheckButton)
         saveNavigation.addStretch(1)
-        self.nextCaseAfterSaveButton = self._primaryButton("标注下一个病例")
+        self.nextCaseAfterSaveButton = self._primaryButton("继续下一个病例")
         self.nextCaseAfterSaveButton.clicked.connect(self._moveToNextCaseAfterSave)
         saveNavigation.addWidget(self.nextCaseAfterSaveButton)
         layout.addLayout(saveNavigation)
@@ -1165,18 +1331,17 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         title.setObjectName("pageTitle")
         layout.addWidget(title)
         text = qt.QLabel(
-            "1. 导入核磁\n"
-            "2. 用画笔涂出下颌髁突\n"
-            "3. 看一下三维效果并检查\n"
-            "4. 保存\n\n"
-            "涂错了就点击“擦除”。\n"
-            "每一层都检查完成后，再进入下一步。"
+            "1. 选择核磁\n"
+            "2. 用画笔把髁突涂出来，涂错就用擦除\n"
+            "3. 每一层都检查，再看一下三维效果\n"
+            "4. 保存本例，继续下一例\n\n"
+            "标好的病例以后会用于训练电脑自动识别下颌髁突。"
         )
         text.setObjectName("mutedLabel")
         text.setWordWrap(True)
         layout.addWidget(text)
         closeButton = self._primaryButton("知道了")
-        closeButton.clicked.connect(dialog.accept)
+        closeButton.clicked.connect(lambda checked=False: dialog.accept())
         layout.addWidget(closeButton)
         self._execDialog(dialog)
 
@@ -1259,6 +1424,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
                     "MouseModeToolBar",
                     "ViewersToolBar",
                     "DialogToolBar",
+                    "menubar",
                 ):
                     for lookupType in (qt.QWidget, "QWidget", qt.QObject, "QObject"):
                         try:
@@ -1302,12 +1468,25 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
                             visible = bool(widget.isVisible())
                         except Exception:
                             visible = True
-                        self._simpleModeTargets.append((widget, visible))
+                            self._simpleModeTargets.append((widget, visible))
                         existing.add(widgetId)
                     try:
                         widget.setVisible(False)
                     except Exception:
                         pass
+                try:
+                    menuBar = mainWindow.menuBar()
+                    menuId = id(menuBar) if menuBar is not None else None
+                    if menuBar is not None and menuId not in existing:
+                        self._simpleModeTargets.append(
+                            (menuBar, bool(menuBar.isVisible()))
+                        )
+                        existing.add(menuId)
+                        menuBar.setVisible(False)
+                    elif menuBar is not None:
+                        menuBar.setVisible(False)
+                except Exception:
+                    pass
                 self._simpleMode = True
             else:
                 for widget, visible in self._simpleModeTargets:
@@ -1321,7 +1500,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self._simpleMode = enabled
         if hasattr(self, "simpleModeButton"):
             self.simpleModeButton.setText(
-                "退出简洁模式" if self._simpleMode else "开启简洁模式"
+                "显示完整 Slicer" if self._simpleMode else "开启简洁模式"
             )
 
     def _dismissFirstHint(self):
@@ -1355,7 +1534,8 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         if index == 3 and self._qcStatus != "通过":
             return False
         self._currentPage = index
-        self.pageStack.setCurrentIndex(index)
+        self._homeVisible = False
+        self.pageStack.setCurrentIndex(index + 1)
         if index == 1:
             self._setAnnotationLayout()
             self._configurePrimarySliceView()
@@ -1368,6 +1548,101 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self._removeViewObservations()
         self._syncUi()
         return True
+
+    def _showHome(self):
+        if self._dirty and not self._confirmUnsaved():
+            return False
+        self._homeVisible = True
+        self.pageStack.setCurrentIndex(0)
+        self._setStatusMessage("欢迎使用。可以开始新的标注或查看病例进度。", "info")
+        self._syncUi()
+        return True
+
+    def _goHome(self, checked=False):
+        return self._showHome()
+
+    def _startNewAnnotationFromHome(self, checked=False):
+        self._showPage(0)
+        self._setStatusMessage("请选择一份核磁文件，或导入病例文件夹。", "info")
+
+    def _continueLastAnnotation(self, checked=False):
+        if self.volumeNode:
+            self._startAnnotation()
+            return
+        self._refreshCaseFiles()
+        if not self._caseFiles:
+            self._showPage(0)
+            self._setStatusMessage("还没有可继续的病例，请先选择核磁文件。", "info")
+            return
+        target = 0
+        for index in range(len(self._caseFiles)):
+            if self._caseStatusForIndex(index) != "已完成":
+                target = index
+                break
+        if self._loadCaseAtIndex(target):
+            self._startAnnotation()
+
+    def _showProgressDialog(self, checked=False, onlyCompleted=False):
+        self._refreshCaseFiles()
+        dialog = qt.QDialog(slicer.util.mainWindow())
+        dialog.setWindowTitle("标注进度")
+        dialog.setMinimumSize(500, 420)
+        dialog.setStyleSheet(self._styleSheet())
+        layout = qt.QVBoxLayout(dialog)
+        title = qt.QLabel("病例进度")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+        summary = qt.QLabel()
+        summary.setObjectName("mutedLabel")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+        rows = qt.QListWidget()
+        rows.setObjectName("progressList")
+        layout.addWidget(rows, 1)
+        rowToCase = []
+        completed = 0
+        for index, path in enumerate(self._caseFiles):
+            status = self._caseStatusForIndex(index)
+            if status == "已完成":
+                completed += 1
+            if onlyCompleted and status != "已完成":
+                continue
+            item = qt.QListWidgetItem(
+                f"{self._caseIdForIndex(path, index)}    {self._statusSymbol(status)} {status}"
+            )
+            rows.addItem(item)
+            rowToCase.append(index)
+        summary.setText(
+            f"{len(self._caseFiles)} 个病例　　已完成：{completed}　　未完成：{len(self._caseFiles) - completed}"
+        )
+        if not rowToCase:
+            rows.addItem("当前没有符合条件的病例。")
+
+        buttonRow = qt.QHBoxLayout()
+        continueButton = self._primaryButton("继续标注")
+        closeButton = self._secondaryButton("关闭")
+        buttonRow.addStretch(1)
+        buttonRow.addWidget(closeButton)
+        buttonRow.addWidget(continueButton)
+        layout.addLayout(buttonRow)
+
+        def openSelected(*args):
+            row = rows.currentRow
+            if row < 0 or row >= len(rowToCase):
+                return
+            index = rowToCase[row]
+            if self._loadCaseAtIndex(index):
+                dialog.accept()
+                self._startAnnotation()
+
+        continueButton.clicked.connect(openSelected)
+        rows.itemDoubleClicked.connect(lambda *args: openSelected())
+        closeButton.clicked.connect(lambda checked=False: dialog.accept())
+        self._execDialog(dialog)
+
+    @staticmethod
+    def _statusSymbol(status):
+        return {"已完成": "✓", "标注中": "●", "未开始": "○"}.get(status, "○")
 
     def _startAnnotation(self):
         volume = self._requireVolume()
@@ -1393,19 +1668,23 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         if not self.segmentationNode:
             self._setStatusMessage("请先开始标注。", "warning")
             return False
-        if not self._annotationHasData:
-            self._setStatusMessage("当前标注为空，检查时会提示这一问题。", "warning")
+        if self._foregroundVoxelCount() <= 0:
+            self._annotationHasData = False
+            self._setStatusMessage("还没有标出髁突，暂时无法生成三维效果。", "warning")
             self._setResultMessage(
                 self.annotationMessageLabel,
-                "当前标注为空，可以先进入检查确认。",
+                "还没有标出髁突，先用画笔标出一部分再检查 3D。",
                 "warning",
             )
+            self._syncUi()
+            return False
         self._setPageForCheck()
         return True
 
     def _setPageForCheck(self):
         self._currentPage = 2
-        self.pageStack.setCurrentIndex(2)
+        self._homeVisible = False
+        self.pageStack.setCurrentIndex(3)
         self._setCheckLayout()
         self._removeViewObservations()
         self._setResultMessage(
@@ -1416,6 +1695,14 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self._setStatusMessage("请从三个方向和三维视图检查标注。", "info")
         self._syncUi()
         self._show3D(silent=True)
+
+    def _show2DCheckView(self, checked=False):
+        if not self.segmentationNode:
+            self._setStatusMessage("请先开始标注。", "warning")
+            return False
+        self._setAnnotationLayout()
+        self._setStatusMessage("已切换到切片视图，可以逐层复核标注。", "info")
+        return True
 
     def _returnToAnnotation(self):
         self._showPage(1)
@@ -1462,14 +1749,38 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         return fallback
 
     def _caseIdForIndex(self, path, index):
+        resolvedPath = Path(path).resolve() if path else None
+        if resolvedPath in self._batchCaseIds:
+            return self._batchCaseIds[resolvedPath]
         candidate = self._safeCaseId(path, fallback="")
         return candidate or f"case_{index + 1:03d}"
 
-    def _refreshCaseFiles(self):
+    @staticmethod
+    def _supportedImageFiles(folder):
+        folder = Path(folder)
         paths = []
-        if self.niftiDir.exists():
-            for pattern in ("*.nii.gz", "*.nii", "*.nrrd"):
-                paths.extend(self.niftiDir.glob(pattern))
+        for pattern in ("*.nii.gz", "*.nii", "*.nrrd"):
+            paths.extend(folder.rglob(pattern))
+        return sorted(
+            {path.resolve() for path in paths if path.is_file()},
+            key=lambda path: (path.name.lower(), str(path).lower()),
+        )
+
+    def _setBatchFiles(self, paths, autoNumber=False):
+        paths = [Path(path).resolve() for path in paths]
+        self._batchCaseFiles = paths
+        self._batchCaseIds = (
+            {path: f"case_{index + 1:03d}" for index, path in enumerate(paths)}
+            if autoNumber
+            else {}
+        )
+        self._refreshCaseFiles()
+
+    def _refreshCaseFiles(self):
+        if self._batchCaseFiles is not None:
+            paths = list(self._batchCaseFiles)
+        else:
+            paths = self._supportedImageFiles(self.niftiDir)
         self._caseFiles = sorted(
             {path.resolve() for path in paths}, key=lambda path: path.name
         )
@@ -1523,15 +1834,45 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         fileName = self._dialogPath(
             qt.QFileDialog.getOpenFileName(
                 slicer.util.mainWindow(),
-                "选择 MRI",
+                "选择核磁文件",
                 str(self.niftiDir),
-                "MRI 文件 (*.nii.gz *.nii *.nrrd);;所有文件 (*)",
+                "核磁文件 (*.nii.gz *.nii *.nrrd);;所有文件 (*)",
             )
         )
         if not fileName:
             return
         if not self._confirmUnsaved():
             return
+        selectedPath = Path(fileName).resolve()
+        if selectedPath.parent == self.niftiDir.resolve():
+            self._batchCaseFiles = None
+            self._batchCaseIds = {}
+        else:
+            self._setBatchFiles([selectedPath], autoNumber=True)
+        self._loadVolumePath(selectedPath, confirm=False)
+
+    def _chooseAndLoadFolder(self):
+        folder = qt.QFileDialog.getExistingDirectory(
+            slicer.util.mainWindow(),
+            "选择病例文件夹",
+            str(self.niftiDir),
+        )
+        if not folder:
+            return
+        if not self._confirmUnsaved():
+            return
+        paths = self._supportedImageFiles(folder)
+        if not paths:
+            self._setStatusMessage(
+                "这个文件夹里没有找到 .nii.gz、.nii 或 .nrrd 文件。", "warning"
+            )
+            return
+        self._setBatchFiles(paths, autoNumber=True)
+        self._loadVolumePath(paths[0], confirm=False)
+
+    def _loadVolumePath(self, fileName, confirm=True):
+        if confirm and not self._confirmUnsaved():
+            return False
         try:
             loaded = slicer.util.loadVolume(str(fileName), returnNode=True)
             node = loaded[1] if isinstance(loaded, tuple) else loaded
@@ -1540,15 +1881,16 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
                 node = slicer.util.loadVolume(str(fileName))
             except Exception as exc:
                 self._handleLoadFailure(fileName, exc)
-                return
+                return False
         except Exception as exc:
             self._handleLoadFailure(fileName, exc)
-            return
+            return False
         if not node:
             self._handleLoadFailure(fileName, "没有返回可用的 MRI")
-            return
+            return False
         self._ownedVolumeIds.add(node.GetID())
         self._setVolumeNode(node, Path(fileName).resolve())
+        return True
 
     def _useSelectedLoadedVolume(self):
         index = self.loadedVolumeSelector.currentIndex
@@ -1622,7 +1964,15 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self._annotationHasData = False
         self._qcStatus = "未检查"
         self._currentPage = 0
-        self.pageStack.setCurrentIndex(0)
+        self._homeVisible = False
+        self._threeDVisible = False
+        self._surfacePointCount = 0
+        self._surfaceCellCount = 0
+        self.pageStack.setCurrentIndex(1)
+        self.saveSuccessLabel.setVisible(False)
+        self.saveResultLabel.clear()
+        self.saveNextGuidanceLabel.clear()
+        self.nextCaseAfterSaveButton.setText("继续下一个病例")
         self._setDetails(
             "当前病例：{0}\nMRI：{1}\n自动保存位置：{2}\nmanifest：{3}".format(
                 self._currentCaseId,
@@ -1640,11 +1990,13 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             except Exception:
                 pass
             self._ownedVolumeIds.discard(oldNode.GetID())
-        self.importResultLabel.setText(
-            f"✓ MRI 已加载\n病例：{self._currentCaseId}"
+        layerCount = int(node.GetImageData().GetDimensions()[self._primaryAxis])
+        self._setResultMessage(
+            self.importResultLabel,
+            f"✓ 已导入\n病例：{self._currentCaseId}\n图像层数：{layerCount} 层",
+            "success",
         )
-        self._setResultMessage(self.importResultLabel, "✓ MRI 已加载\n病例：" + self._currentCaseId, "success")
-        self._setStatusMessage("MRI 已加载，可以开始标注。", "success")
+        self._setStatusMessage("病例已导入，可以开始标注髁突。", "success")
         self._syncUi()
 
     def _ensureVolumeDisplay(self, node):
@@ -1686,24 +2038,16 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         if not self._confirmUnsaved():
             return False
         path = self._caseFiles[target]
-        try:
-            loaded = slicer.util.loadVolume(str(path), returnNode=True)
-            node = loaded[1] if isinstance(loaded, tuple) else loaded
-        except TypeError:
-            try:
-                node = slicer.util.loadVolume(str(path))
-            except Exception as exc:
-                self._handleLoadFailure(path, exc)
-                return False
-        except Exception as exc:
-            self._handleLoadFailure(path, exc)
+        return self._loadVolumePath(path, confirm=False)
+
+    def _loadCaseAtIndex(self, index):
+        self._refreshCaseFiles()
+        if index < 0 or index >= len(self._caseFiles):
             return False
-        if not node:
-            self._handleLoadFailure(path, "没有返回可用的 MRI")
-            return False
-        self._ownedVolumeIds.add(node.GetID())
-        self._setVolumeNode(node, path)
-        return True
+        if self.volumeNode and self._currentCaseIndex == index:
+            return True
+        path = self._caseFiles[index]
+        return self._loadVolumePath(path, confirm=True)
 
     # ------------------------------------------------------------------
     # Segmentation and effects
@@ -1731,7 +2075,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             )
             segmentation = self.segmentationNode.GetSegmentation()
             self.segmentId = segmentation.AddEmptySegment(
-                "Mandibular Condyle",
+                "下颌髁突",
                 "MandibularCondyle",
                 (0.16, 0.72, 0.78),
             )
@@ -1753,8 +2097,47 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         finally:
             self._isUpdating = False
         self._observeSegmentation()
+        self._threeDVisible = False
+        self._surfacePointCount = 0
+        self._surfaceCellCount = 0
         self._syncUi()
         return True
+
+    def _foregroundVoxelCount(self):
+        if not self.segmentationNode or not self.segmentId:
+            return 0
+        try:
+            array = slicer.util.arrayFromSegmentInternalBinaryLabelmap(
+                self.segmentationNode, self.segmentId
+            )
+            if array is not None:
+                return int(np.count_nonzero(np.asarray(array)))
+        except Exception:
+            pass
+        try:
+            segment = self.segmentationNode.GetSegmentation().GetSegment(
+                self.segmentId
+            )
+            binary = segment.GetRepresentation("Binary labelmap")
+            if binary and binary.GetImageData():
+                return int(binary.GetImageData().GetScalarRange()[1] > 0)
+        except Exception:
+            pass
+        return 0
+
+    def _caseStatusForIndex(self, index):
+        if index < 0 or index >= len(self._caseFiles):
+            return "未开始"
+        path = self._caseFiles[index]
+        if self._currentCasePath and Path(path).resolve() == self._currentCasePath:
+            if self._saved and not self._dirty:
+                return "已完成"
+            if self._foregroundVoxelCount() > 0:
+                return "标注中"
+        caseId = self._caseIdForIndex(path, index)
+        if (self.labelsDir / f"{caseId}.nii.gz").exists():
+            return "已完成"
+        return "未开始"
 
     def _applySegmentationDisplaySettings(self):
         if not self.segmentationNode:
@@ -1776,6 +2159,12 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
                 display.SetSegmentOpacity3D(self.segmentId, 0.45)
             if self.segmentId and hasattr(display, "SetSegmentVisibility"):
                 display.SetSegmentVisibility(self.segmentId, True)
+            if self.segmentId and hasattr(display, "SetSegmentVisibility3D"):
+                display.SetSegmentVisibility3D(self.segmentId, True)
+            if self.segmentId and hasattr(display, "SetSegmentVisibility2DFill"):
+                display.SetSegmentVisibility2DFill(self.segmentId, True)
+            if self.segmentId and hasattr(display, "SetSegmentVisibility2DOutline"):
+                display.SetSegmentVisibility2DOutline(self.segmentId, True)
         except Exception:
             pass
 
@@ -1799,9 +2188,9 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             if segmentation.GetNumberOfSegments() == 1:
                 self.segmentId = segmentation.GetNthSegmentID(0)
                 segment = segmentation.GetSegment(self.segmentId)
-                segment.SetName("Mandibular Condyle")
+                segment.SetName("下颌髁突")
                 segment.SetColor(0.16, 0.72, 0.78)
-            self._annotationHasData = True
+            self._annotationHasData = self._foregroundVoxelCount() > 0
             self._saved = True
             self._dirty = False
         except Exception:
@@ -1869,8 +2258,9 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             return
         self._dirty = True
         self._saved = False
-        self._annotationHasData = True
+        self._annotationHasData = self._foregroundVoxelCount() > 0
         self._qcStatus = "未检查"
+        self._threeDVisible = False
         self._setResultMessage(
             self.annotationMessageLabel,
             "标注已修改，完成后请进入检查。",
@@ -2282,19 +2672,177 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             if not silent:
                 self._setStatusMessage("请先开始标注。", "warning")
             return False
+        foreground = self._foregroundVoxelCount()
+        if foreground <= 0:
+            self._threeDVisible = False
+            self._surfacePointCount = 0
+            self._surfaceCellCount = 0
+            self._setResultMessage(
+                self.qcResultLabel,
+                "还没有标出髁突，暂时无法生成三维效果。\n请返回继续标注。",
+                "warning",
+            )
+            if not silent:
+                self._setStatusMessage("还没有标出髁突，暂时无法生成三维效果。", "warning")
+            self._syncUi()
+            return False
         try:
+            segmentation = self.segmentationNode.GetSegmentation()
+            if segmentation.GetNumberOfSegments() != 1 or not self.segmentId:
+                raise RuntimeError("expected exactly one condyle segment")
+
+            # Keep the official segmentation conversion pipeline.  Recreating
+            # the closed surface here also refreshes it after a paint/erase
+            # change instead of relying on a stale cached representation.
             self.segmentationNode.CreateClosedSurfaceRepresentation()
+            slicer.app.processEvents()
             self._applySegmentationDisplaySettings()
+
+            segment = segmentation.GetSegment(self.segmentId)
+            closedName = "Closed surface"
+            try:
+                closedName = (
+                    slicer.vtkSegmentationConverter
+                    .GetSegmentationClosedSurfaceRepresentationName()
+                )
+            except Exception:
+                pass
+            surface = segment.GetRepresentation(closedName)
+            if surface is None and closedName != "Closed surface":
+                surface = segment.GetRepresentation("Closed surface")
+            if surface is None:
+                raise RuntimeError("closed surface representation was not created")
+            pointCount = (
+                int(surface.GetNumberOfPoints())
+                if hasattr(surface, "GetNumberOfPoints")
+                else 0
+            )
+            cellCount = (
+                int(surface.GetNumberOfCells())
+                if hasattr(surface, "GetNumberOfCells")
+                else 0
+            )
+            if pointCount <= 0 or cellCount <= 0:
+                raise RuntimeError(
+                    f"closed surface is empty (points={pointCount}, cells={cellCount})"
+                )
+            surfaceBounds = [0.0] * 6
+            surface.GetBounds(surfaceBounds)
+            if not all(np.isfinite(value) for value in surfaceBounds):
+                raise RuntimeError("closed surface bounds are invalid")
+            surfaceSize = max(
+                surfaceBounds[1] - surfaceBounds[0],
+                surfaceBounds[3] - surfaceBounds[2],
+                surfaceBounds[5] - surfaceBounds[4],
+            )
+            if surfaceSize <= 0:
+                raise RuntimeError("closed surface bounds are empty")
+            display = self.segmentationNode.GetDisplayNode()
+            if display and hasattr(display, "SetPreferredDisplayRepresentationName3D"):
+                display.SetPreferredDisplayRepresentationName3D(closedName)
+            if display and hasattr(display, "SetSegmentOpacity3D"):
+                display.SetSegmentOpacity3D(self.segmentId, 0.9)
+            if display and hasattr(display, "SetSegmentVisibility3D"):
+                display.SetSegmentVisibility3D(self.segmentId, True)
+
+            # Change to the four-up layout so the 3D widget is definitely
+            # present, then fit the camera to the visible segmentation actor.
             self._setCheckLayout()
             manager = slicer.app.layoutManager()
-            if manager.threeDViewCount > 0:
-                view = manager.threeDWidget(0).threeDView()
+            threeDCount = getattr(manager, "threeDViewCount", 0)
+            if callable(threeDCount):
+                threeDCount = threeDCount()
+            if int(threeDCount) <= 0:
+                raise RuntimeError("the current Slicer layout has no 3D view")
+            widget = manager.threeDWidget(0)
+            view = widget.threeDView()
+            view.show()
+            if hasattr(view, "resetCamera"):
+                view.resetCamera()
+            if hasattr(view, "resetFocalPoint"):
                 view.resetFocalPoint()
+            # Slicer's generic reset can use the full reference-image bounds,
+            # which makes a small condyle look like a missing surface.  Keep
+            # the official 3D view/camera and retarget it to the actual
+            # closed-surface bounds before the final render.
+            cameraNode = view.cameraNode() if hasattr(view, "cameraNode") else None
+            if cameraNode:
+                center = [
+                    (surfaceBounds[0] + surfaceBounds[1]) * 0.5,
+                    (surfaceBounds[2] + surfaceBounds[3]) * 0.5,
+                    (surfaceBounds[4] + surfaceBounds[5]) * 0.5,
+                ]
+                try:
+                    oldPosition = [float(value) for value in cameraNode.GetPosition()]
+                    oldFocal = [float(value) for value in cameraNode.GetFocalPoint()]
+                    direction = [oldPosition[i] - oldFocal[i] for i in range(3)]
+                except Exception:
+                    direction = [0.0, 0.0, 1.0]
+                directionLength = float(np.linalg.norm(direction))
+                if directionLength <= 1e-6:
+                    direction = [0.0, 0.0, 1.0]
+                    directionLength = 1.0
+                # The default camera may be hundreds of millimetres away when
+                # the layout has no visible actor yet.  Reusing that distance
+                # is precisely what makes a small surface look absent in a
+                # perspective view, so derive the distance only from the
+                # actual surface size.
+                distance = max(surfaceSize * 3.0, 1.0)
+                normalized = [value / directionLength for value in direction]
+                position = [
+                    center[i] + normalized[i] * distance for i in range(3)
+                ]
+                cameraNode.SetFocalPoint(center)
+                cameraNode.SetPosition(position)
+                cameraNode.SetParallelScale(max(surfaceSize * 0.9, 0.5))
+                cameraNode.Modified()
+                cameraNode.GetCamera().SetClippingRange(
+                    0.1, max(distance + surfaceSize * 5.0, 10.0)
+                )
+            if hasattr(view, "renderWindow"):
+                view.renderWindow().Render()
+            if cameraNode:
+                # The first render attaches the segmentation actor.  Apply
+                # the near/far range once more so Slicer's automatic clipping
+                # calculation cannot leave the actor behind the near plane.
+                cameraNode.GetCamera().SetClippingRange(
+                    0.1, max(distance + surfaceSize * 5.0, 10.0)
+                )
+                cameraNode.Modified()
+                if hasattr(view, "renderWindow"):
+                    view.renderWindow().Render()
+            slicer.app.processEvents()
+
+            self._threeDVisible = True
+            self._surfacePointCount = pointCount
+            self._surfaceCellCount = cellCount
+            self._setDetails(
+                f"三维显示完成\n病例：{self._currentCaseId}\n"
+                f"前景体素数：{foreground}\n"
+                f"Closed surface 点数：{pointCount}\n"
+                f"Closed surface 面数：{cellCount}\n"
+                f"surface bounds：{[round(value, 3) for value in surfaceBounds]}\n"
+                "3D visibility：已打开\n相机：已自动对准髁突范围"
+            )
+            self._setResultMessage(
+                self.qcResultLabel,
+                "✓ 三维髁突已显示\n请旋转查看形状，再点击“检查标注”。",
+                "success",
+            )
             self._setStatusMessage("三维髁突已显示，请旋转检查轮廓。", "success")
+            self._syncUi()
             return True
         except Exception:
+            self._threeDVisible = False
+            self._surfacePointCount = 0
+            self._surfaceCellCount = 0
             self._setDetails("显示三维失败\n" + traceback.format_exc())
             if not silent:
+                self._setResultMessage(
+                    self.qcResultLabel,
+                    "三维效果没有成功生成，请返回修改标注后重试。",
+                    "warning",
+                )
                 self._setStatusMessage("三维视图暂时无法显示，请重试。", "warning")
             return False
 
@@ -2430,6 +2978,20 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
                     pass
 
     def _checkAnnotation(self):
+        if self._foregroundVoxelCount() <= 0:
+            self._qcStatus = "需要确认"
+            self._setResultMessage(
+                self.qcResultLabel,
+                "还没有标出髁突，暂时无法完成检查。",
+                "warning",
+            )
+            self._setStatusMessage("还没有标出髁突，暂时无法完成检查。", "warning")
+            self._syncUi()
+            return False
+        if not self._threeDVisible and not self._show3D(silent=True):
+            self._qcStatus = "需要确认"
+            self._syncUi()
+            return False
         result = self._runQualityCheck()
         self._setDetails(result.get("details", "") or self._lastDetailText)
         issues = result.get("issues", [])
@@ -2496,11 +3058,37 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self._dirty = False
             self._annotationHasData = True
             self._qcStatus = "通过"
+            completed = sum(
+                self._caseStatusForIndex(index) == "已完成"
+                for index in range(len(self._caseFiles))
+            )
             self.saveSuccessLabel.setVisible(True)
+            self.saveSuccessLabel.setText(f"✓ {self._currentCaseId} 保存成功")
             self._setResultMessage(
                 self.saveResultLabel,
-                f"{self._currentCaseId} 已保存。",
+                f"✓ {self._currentCaseId} 保存成功",
                 "success",
+            )
+            if len(self._caseFiles) <= 1:
+                nextGuidance = (
+                    "这一例已经完成。\n"
+                    "如果还有其它病例，可以继续导入和标注。\n"
+                    "建议先完成至少 5 例进行第一次检查，之后再继续标更多病例。"
+                )
+            elif completed == len(self._caseFiles):
+                nextGuidance = "全部病例已经完成。"
+            else:
+                nextGuidance = (
+                    f"已完成 {completed} / {len(self._caseFiles)} 例。\n"
+                    "可以继续下一个病例。"
+                )
+            self._setResultMessage(
+                self.saveNextGuidanceLabel, nextGuidance, "neutral"
+            )
+            self.nextCaseAfterSaveButton.setText(
+                "继续下一个病例"
+                if self._currentCaseIndex < len(self._caseFiles) - 1
+                else "全部病例已经完成"
             )
             self._setDetails(
                 f"保存完成\n病例：{self._currentCaseId}\n"
@@ -2587,6 +3175,9 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.segmentId = None
         self._annotationHasData = False
         self._editorViewsObserved = False
+        self._threeDVisible = False
+        self._surfacePointCount = 0
+        self._surfaceCellCount = 0
 
     def _askUnsavedDecision(self):
         box = qt.QMessageBox(slicer.util.mainWindow())
@@ -2695,6 +3286,8 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
     def _currentStep(self):
         if not self.volumeNode:
             return 0
+        if self._homeVisible:
+            return 0
         return self._currentPage
 
     def _stepIsDone(self, index):
@@ -2712,17 +3305,41 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         if not hasattr(self, "pageStack"):
             return
         status = self._statusText()
-        self.caseIdValue.setText(self._currentCaseId)
+        if not self.volumeNode and not self._caseFiles:
+            self.caseIdValue.setText("未选择")
+            self.caseProgressValue.setText("—")
+            self.caseStatusValue.setText("等待导入")
+            self.caseSaveValue.setText("—")
+        else:
+            self.caseIdValue.setText(self._currentCaseId)
         if self._caseFiles and self._currentCaseIndex >= 0:
             progress = f"{self._currentCaseIndex + 1} / {len(self._caseFiles)}"
         elif self._caseFiles:
             progress = f"— / {len(self._caseFiles)}"
         else:
             progress = "1 / 1"
-        self.caseProgressValue.setText(progress)
-        self.caseStatusValue.setText(status)
-        self.caseSaveValue.setText("已保存" if self._saved and not self._dirty else "未保存")
+        if self.volumeNode or self._caseFiles:
+            self.caseProgressValue.setText(progress)
+            self.caseStatusValue.setText(status)
+            self.caseSaveValue.setText(
+                "已保存" if self._saved and not self._dirty else "未保存"
+            )
         self.caseNavigationLabel.setText("病例 " + progress)
+
+        if hasattr(self, "homeProgressLabel"):
+            completed = sum(
+                self._caseStatusForIndex(index) == "已完成"
+                for index in range(len(self._caseFiles))
+            )
+            total = len(self._caseFiles)
+            self.homeProgressLabel.setText(
+                f"病例进度：{total} 个病例　　已完成：{completed}　　未完成：{total - completed}"
+                if total
+                else "还没有导入病例。"
+            )
+            self.homeContinueButton.setEnabled(bool(self.volumeNode or self._caseFiles))
+            self.homeProgressButton.setEnabled(bool(self._caseFiles))
+            self.homeAnnotatedButton.setEnabled(completed > 0)
 
         statusState = "complete" if status == "已完成" else "working" if status == "标注中" else ""
         statusPrefix = "✓ " if status == "已完成" else "● "
@@ -2759,7 +3376,10 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.opacitySlider.setEnabled(hasSegmentation)
         self.annotateNextButton.setEnabled(hasSegmentation)
         self.show3DButton.setEnabled(hasSegmentation)
+        self.redisplay3DButton.setEnabled(hasSegmentation)
         self.checkButton.setEnabled(hasSegmentation)
+        self.view2DButton.setEnabled(hasSegmentation)
+        self.view3DButton.setEnabled(hasSegmentation)
         self.confirmCheckButton.setEnabled(self._qcStatus == "通过")
         self.saveButton.setEnabled(
             hasSegmentation and self._qcStatus == "通过"
@@ -2786,10 +3406,10 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             return
         self.saveSummaryLabel.setText(
             f"病例：{self._currentCaseId}\n"
-            f"✓ MRI 已加载\n"
-            f"✓ 已完成标注\n"
-            f"✓ 技术检查：{self._qcStatus}"
-        )
+                f"✓ 病例已导入\n"
+                f"✓ 已完成标注\n"
+                "✓ 技术检查完成"
+            )
 
 
 class TMJCondyleAnnotatorTest(ScriptedLoadableModuleTest):

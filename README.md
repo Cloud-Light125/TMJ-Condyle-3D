@@ -35,6 +35,24 @@ python scripts/check_environment.py 的输出和 reports/ 下的报告为准。
 
 ## 快速开始（Windows）
 
+### 最简单使用方法
+
+双击项目根目录的：
+
+    启动下颌髁突标注.bat
+
+启动器会自动寻找已安装的 3D Slicer，临时加载本项目模块，并直接打开
+“下颌髁突三维标注”工作台。第一次使用不需要进入 Settings，也不需要手动添加
+Additional module paths。
+
+如果希望在桌面使用快捷方式，可运行：
+
+~~~powershell
+powershell -ExecutionPolicy Bypass -File scripts/create_desktop_shortcut.ps1
+~~~
+
+它只会为本项目创建“下颌髁突三维标注”快捷方式，不会修改 Slicer 全局配置。
+
 建议使用已安装的 Python 3.10 或 3.11 建立隔离环境。项目脚本可以直接从项目根目录运行。
 
 ~~~powershell
@@ -65,11 +83,11 @@ $env:nnUNet_results = "C:/code/TMJ-Condyle-3D/workspace/nnUNet_results"
 2. 用 scripts/dicom_to_nifti.py --case-id case_001 转换唯一 Series。多 Series 时
    先根据 inspect_dicom.py 返回的匿名 series_index 选择目标序列；也可以在私有
    本地命令中传入 SeriesInstanceUID。项目不会按文件名猜顺序。
-3. 在 3D Slicer 中安装本项目的 slicer/TMJCondyleAnnotator 模块。
-4. 在“下颌髁突三维标注”工作台中点击“下一步：开始标注”，使用中文“画笔”和
+3. 双击“启动下颌髁突标注.bat”，或在“开发者 / 高级使用”中手工加载本项目模块。
+4. 在“下颌髁突三维标注”工作台中点击“下一步：标注髁突”，使用中文“画笔”和
    “擦除”逐层画髁突；整个流程留在本项目页面，不切换到原生 Segment Editor。
-5. 点击“标完了，下一步：检查”，查看三视图和 3D 髁突，技术检查通过后保存 mask。
-   保存动作会拒绝空 mask、非 0/1 标签和 geometry 不一致。
+5. 点击“标完了，检查三维”，查看三视图和 3D 髁突，技术检查通过后保存结果。
+   保存动作会拒绝空标注、非 0/1 标签和 geometry 不一致。
 6. 将病例状态保持为 ANNOTATED 或 VERIFIED，再运行数据集 QC。
 
 详细步骤见 docs/ANNOTATION_GUIDE_zh-CN.md 和 docs/DATASET_GUIDE_zh-CN.md。
@@ -216,6 +234,12 @@ python scripts/scan_git_safety.py --staged
 发布前确认没有 DICOM、NIfTI、mask、JSON sidecar、患者字段、checkpoint、缓存或
 运行时。当前工作区不自动创建或推送 GitHub 公共仓库；远程仓库创建、账号授权和
 push 必须由项目维护者在确认扫描结果后自行执行。
+
+## 开发者 / 高级使用
+
+如需手工加载模块，可将 `slicer/TMJCondyleAnnotator` 作为 Slicer 的
+Additional module path，然后重启 Slicer。日常使用推荐使用项目根目录的一键启动器，
+这样不会改变 Slicer 的全局设置。
 
 ## 项目目标
 
