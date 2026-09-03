@@ -118,14 +118,24 @@ def collect_environment_report(manifest: Path = MANIFEST_PATH) -> dict[str, obje
             images_dir=NIFTI_DIR,
             labels_dir=LABELS_DIR,
             report_dir=REPORTS_DIR,
+            statuses={"VERIFIED"},
         )
     ready_cases = [
         row
         for row in validation_rows
         if row["status"] == "PASS"
-        and row.get("annotation_status") in {"ANNOTATED", "VERIFIED"}
+        and row.get("annotation_status", "").upper() == "VERIFIED"
     ]
     groups = {str(row.get("group_id") or row["case_id"]) for row in ready_cases}
+    manifest_rows = read_manifest(manifest)
+    manual_case_count = sum(
+        str(row.get("annotation_status", "")).upper() in {"ANNOTATED", "VERIFIED"}
+        for row in manifest_rows
+    )
+    verified_case_count = sum(
+        str(row.get("annotation_status", "")).upper() == "VERIFIED"
+        for row in manifest_rows
+    )
     env_ready = (
         sitk_version != "NOT INSTALLED"
         and scipy_version != "NOT INSTALLED"
@@ -162,7 +172,9 @@ def collect_environment_report(manifest: Path = MANIFEST_PATH) -> dict[str, obje
         "image_count": image_count,
         "label_count": label_count,
         "validated_case_count": len(validation_rows),
-        "annotated_case_count": len(ready_cases),
+        "annotated_case_count": manual_case_count,
+        "verified_case_count": verified_case_count,
+        "trainable_case_count": len(ready_cases),
         "group_count": len(groups),
         "validation_ok": validation_ok,
         "data_ready": data_ready,
@@ -205,7 +217,9 @@ def main() -> int:
             print(f"{name} directory: {path} ({'EXISTS' if Path(path).exists() else 'MISSING'})")
         print(f"Number of images: {report['image_count']}")
         print(f"Number of labels: {report['label_count']}")
-        print(f"Ready cases: {report['annotated_case_count']}")
+        print(f"Manual annotation complete: {report['annotated_case_count']}")
+        print(f"Verified cases: {report['verified_case_count']}")
+        print(f"Trainable cases: {report['trainable_case_count']}")
         print(f"Missing labels: {report['missing_labels'] or 'none'}")
         print(f"Geometry errors: {report['geometry_errors'] or 'none'}")
         print("READY FOR ANNOTATION" if report["image_count"] > 0 and report["packages"]["SimpleITK"] != "NOT INSTALLED" else "NOT READY FOR ANNOTATION")

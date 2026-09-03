@@ -12,7 +12,7 @@ from tmj_condyle.config import (
     NNUNET_PREPROCESSED_DIR,
     REPORTS_DIR,
 )
-from tmj_condyle.data.manifest import read_manifest
+from tmj_condyle.data.manifest import ANNOTATION_STATUSES, read_manifest
 from tmj_condyle.data.splits import (
     build_grouped_splits,
     write_fold_assignments,
@@ -30,18 +30,29 @@ def main() -> int:
     parser.add_argument("--dataset-name", default=DATASET_NAME)
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--seed", type=int, default=DEFAULT_SPLIT_SEED)
+    parser.add_argument(
+        "--include-status",
+        action="append",
+        choices=sorted(ANNOTATION_STATUSES),
+        dest="include_statuses",
+        help="高级覆盖：额外允许指定状态；默认只使用 VERIFIED。可重复传入。",
+    )
     args = parser.parse_args()
+
+    allowed_statuses = {
+        value.upper() for value in (args.include_statuses or ["VERIFIED"])
+    }
 
     rows = [
         row
         for row in read_manifest(args.manifest)
-        if row.get("annotation_status") in {"ANNOTATED", "VERIFIED"}
+        if row.get("annotation_status", "").upper() in allowed_statuses
         and row.get("image_path")
         and row.get("label_path")
     ]
     if not rows:
         raise RuntimeError(
-            "No annotated cases found. Create real masks in 3D Slicer first."
+            "No VERIFIED cases found. Confirm real masks in the TMJ workbench first."
         )
     splits = build_grouped_splits(rows, n_splits=args.n_splits, seed=args.seed)
     output = args.out or (

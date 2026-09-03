@@ -44,10 +44,27 @@ def validate_manifest_dataset(
     images_dir: str | Path = NIFTI_DIR,
     labels_dir: str | Path = LABELS_DIR,
     report_dir: str | Path = REPORTS_DIR,
+    statuses: set[str] | None = None,
 ) -> tuple[list[dict[str, object]], bool]:
-    """Validate all manifest rows and report orphan files."""
+    """Validate manifest rows and report orphan files.
 
-    manifest_rows = read_manifest(manifest_path)
+    When ``statuses`` is supplied, only rows with one of those annotation
+    statuses are considered.  The training workflow uses ``{"VERIFIED"}`` so
+    a newly imported MRI or an unconfirmed mask cannot block or enter formal
+    training data.
+    """
+
+    all_manifest_rows = read_manifest(manifest_path)
+    allowed_statuses = {str(value).upper() for value in statuses} if statuses else None
+    manifest_rows = (
+        [
+            row
+            for row in all_manifest_rows
+            if str(row.get("annotation_status", "")).upper() in allowed_statuses
+        ]
+        if allowed_statuses is not None
+        else all_manifest_rows
+    )
     image_files, duplicate_image_ids = _index_nifti_files(images_dir)
     label_files, duplicate_label_ids = _index_nifti_files(labels_dir)
     duplicate_manifest_ids = {
@@ -60,7 +77,11 @@ def validate_manifest_dataset(
         case_id = row.get("case_id", "")
         by_case.setdefault(case_id, row)
 
-    all_case_ids = sorted(set(by_case) | set(image_files) | set(label_files))
+    all_case_ids = (
+        sorted(set(by_case))
+        if allowed_statuses is not None
+        else sorted(set(by_case) | set(image_files) | set(label_files))
+    )
     result_rows: list[dict[str, object]] = []
     for case_id in all_case_ids:
         row = by_case.get(case_id, {})

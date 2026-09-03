@@ -11,7 +11,6 @@ from __future__ import annotations
 import csv
 import datetime
 import json
-import os
 import re
 import shutil
 import sys
@@ -56,6 +55,7 @@ from tmj_condyle.experiment import (  # noqa: E402
     format_metric,
     has_evaluation_results,
     home_next_step,
+    home_next_action,
     list_experiment_runs,
     load_case_inventory,
     oof_command,
@@ -72,9 +72,17 @@ from tmj_condyle.experiment import (  # noqa: E402
     script_command,
     summarize_metrics_by_fold,
     training_command,
+    training_prerequisite_summary,
     user_training_message,
+    should_show_first_run_wizard,
 )
 from tmj_condyle.data.manifest import read_manifest  # noqa: E402
+from tmj_condyle.launcher import (  # noqa: E402
+    configured_slicer_path,
+    discover_slicer_candidates,
+    slicer_config_path,
+    write_slicer_config,
+)
 
 
 CASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -188,6 +196,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self._saved = False
         self._annotationHasData = False
         self._qcStatus = "未检查"
+        self._currentAnnotationStatus = "NEW"
         self._currentEffectName = "Paint"
         self._currentCaseId = "case_001"
         self._currentCasePath = None
@@ -214,7 +223,9 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self._processStartedAt = None
         self._processStopRequested = False
         self._environmentReport = None
-        self._validationRows = []
+        self._validationRows = read_validation_csv(
+            self.projectRoot / "workspace" / "reports" / "dataset_validation.csv"
+        )
         self._validationPassed = False
         self._datasetPrepared = False
         self._preprocessingPrepared = False
@@ -235,6 +246,8 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self._resultPredictionNode = None
         self._resultCompareSegmentationNode = None
         self._taskTimer = None
+        self._firstRunWizardDialog = None
+        self._slicerCandidates = []
 
         self._simpleMode = False
         self._simpleModeTargets = []
@@ -257,6 +270,9 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         qt.QTimer.singleShot(800, lambda: self._setSimpleMode(True))
         self._setStatusMessage("欢迎使用。先导入病例并标注下颌髁突。", "info")
         self._syncUi()
+        # Show the novice orientation only after the module widget exists and
+        # Slicer has had a chance to finish constructing its main window.
+        qt.QTimer.singleShot(700, self._showFirstRunWizardIfNeeded)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -713,7 +729,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
 
         right = qt.QVBoxLayout()
         actionRow = qt.QHBoxLayout()
-        self.homeButton = self._linkButton("首页")
+        self.homeButton = self._linkButton("返回首页")
         self.homeButton.clicked.connect(self._goHome)
         actionRow.addWidget(self.homeButton)
         self.helpButton = self._linkButton("？ 使用帮助")
@@ -829,6 +845,9 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.homeNextStepLabel.setObjectName("homeNextStep")
         self.homeNextStepLabel.setWordWrap(True)
         layout.addWidget(self.homeNextStepLabel)
+        self.homeNextActionButton = self._primaryButton("开始导入病例")
+        self.homeNextActionButton.clicked.connect(self._runHomeNextAction)
+        layout.addWidget(self.homeNextActionButton, 0, qt.Qt.AlignLeft)
 
         statsCard = self._card("statCard")
         statsLayout = qt.QHBoxLayout(statsCard)
@@ -836,7 +855,8 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.homeStatLabels = {}
         for key, caption in (
             ("total", "病例总数"),
-            ("annotated", "已标注"),
+            ("manual", "人工标注完成"),
+            ("verified", "已验证标注"),
             ("trainable", "可用于训练"),
             ("training", "训练状态"),
             ("results", "实验结果"),
@@ -852,6 +872,18 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             statsLayout.addLayout(column, 1)
             self.homeStatLabels[key] = valueLabel
         layout.addWidget(statsCard)
+
+        workflowCard = self._card("hintCard")
+        workflowLayout = qt.QVBoxLayout(workflowCard)
+        workflowLayout.setContentsMargins(14, 12, 14, 12)
+        workflowTitle = qt.QLabel("实验流程状态")
+        workflowTitle.setObjectName("sectionTitle")
+        workflowLayout.addWidget(workflowTitle)
+        self.homeWorkflowLabel = qt.QLabel()
+        self.homeWorkflowLabel.setObjectName("hintLabel")
+        self.homeWorkflowLabel.setWordWrap(True)
+        workflowLayout.addWidget(self.homeWorkflowLabel)
+        layout.addWidget(workflowCard)
 
         cards = qt.QGridLayout()
         cards.setHorizontalSpacing(10)
@@ -880,6 +912,12 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.homeHelpButton = self._homeCardButton("怎么做实验？")
         self.homeHelpButton.clicked.connect(self._showUsageGuide)
         cards.addWidget(self.homeHelpButton, 3, 1)
+        self.homeDemoButton = self._homeCardButton("查看软件演示")
+        self.homeDemoButton.clicked.connect(self._showDemoDialog)
+        cards.addWidget(self.homeDemoButton, 4, 0)
+        self.homeSettingsButton = self._homeCardButton("平台设置")
+        self.homeSettingsButton.clicked.connect(lambda checked=False: self._showMainPage("settings"))
+        cards.addWidget(self.homeSettingsButton, 4, 1)
         layout.addLayout(cards)
 
         processCard = self._card("hintCard")
@@ -1218,6 +1256,16 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.saveButton.clicked.connect(self._saveAnnotation)
         layout.addWidget(self.saveButton)
 
+        self.confirmAnnotationButton = self._primaryButton("确认本例标注")
+        self.confirmAnnotationButton.clicked.connect(self._confirmAnnotation)
+        layout.addWidget(self.confirmAnnotationButton)
+        self.confirmAnnotationHintLabel = qt.QLabel(
+            "确认后，这一例可以用于训练。确认前请由牙医或项目负责人完成复核。"
+        )
+        self.confirmAnnotationHintLabel.setObjectName("mutedLabel")
+        self.confirmAnnotationHintLabel.setWordWrap(True)
+        layout.addWidget(self.confirmAnnotationHintLabel)
+
         self.saveResultLabel = qt.QLabel()
         self.saveResultLabel.setObjectName("resultMessage")
         self.saveResultLabel.setWordWrap(True)
@@ -1264,6 +1312,10 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.datasetGuidanceLabel.setObjectName("infoMessage")
         self.datasetGuidanceLabel.setWordWrap(True)
         layout.addWidget(self.datasetGuidanceLabel)
+        self.datasetExcludedLabel = qt.QLabel()
+        self.datasetExcludedLabel.setObjectName("mutedLabel")
+        self.datasetExcludedLabel.setWordWrap(True)
+        layout.addWidget(self.datasetExcludedLabel)
 
         stepCard = self._card("hintCard")
         stepLayout = qt.QVBoxLayout(stepCard)
@@ -1550,29 +1602,65 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             layout,
             "平台设置",
             "设置",
-            "普通实验不需要修改这些选项。这里集中显示项目位置、固定任务定义和高级诊断入口。",
+            "普通实验不需要修改这些选项。Slicer 路径由启动器自动管理，项目目录和技术细节只在高级功能中显示。",
         )
         settingsCard = self._card("hintCard")
         settingsLayout = qt.QFormLayout(settingsCard)
         settingsLayout.setContentsMargins(13, 11, 13, 11)
-        self.settingsPythonLabel = qt.QLabel("—")
-        self.settingsPythonLabel.setWordWrap(True)
-        self.settingsDatasetLabel = qt.QLabel("—")
-        self.settingsDatasetLabel.setWordWrap(True)
-        self.settingsWorkspaceLabel = qt.QLabel("—")
-        self.settingsWorkspaceLabel.setWordWrap(True)
-        settingsLayout.addRow("项目 Python：", self.settingsPythonLabel)
-        settingsLayout.addRow("训练数据：", self.settingsDatasetLabel)
-        settingsLayout.addRow("工作区：", self.settingsWorkspaceLabel)
-        settingsLayout.addRow("固定配置：", qt.QLabel("nnU-Net v2 · 3d_fullres · binary · 5-fold"))
+        self.settingsSlicerStatusLabel = qt.QLabel("正在检测…")
+        self.settingsSlicerStatusLabel.setObjectName("sectionTitle")
+        self.settingsSlicerVersionLabel = qt.QLabel("—")
+        self.settingsSlicerPathLabel = qt.QLabel("路径已隐藏")
+        self.settingsSlicerPathLabel.setObjectName("mutedLabel")
+        self.settingsSlicerPathLabel.setWordWrap(True)
+        settingsLayout.addRow("3D Slicer：", self.settingsSlicerStatusLabel)
+        settingsLayout.addRow("版本：", self.settingsSlicerVersionLabel)
+        settingsLayout.addRow("路径：", self.settingsSlicerPathLabel)
+        slicerButtonRow = qt.QHBoxLayout()
+        self.settingsChangeSlicerButton = self._secondaryButton("更换")
+        self.settingsChangeSlicerButton.clicked.connect(self._changeSlicerPath)
+        slicerButtonRow.addWidget(self.settingsChangeSlicerButton)
+        self.settingsRedetectSlicerButton = self._secondaryButton("重新检测")
+        self.settingsRedetectSlicerButton.clicked.connect(self._redetectSlicer)
+        slicerButtonRow.addWidget(self.settingsRedetectSlicerButton)
+        slicerButtonRow.addStretch(1)
+        settingsLayout.addRow("操作：", slicerButtonRow)
+        self.settingsTrainingLabel = qt.QLabel("训练环境尚未检测")
+        self.settingsTrainingLabel.setWordWrap(True)
+        settingsLayout.addRow("训练环境：", self.settingsTrainingLabel)
+        self.settingsGpuLabel = qt.QLabel("—")
+        self.settingsGpuLabel.setWordWrap(True)
+        settingsLayout.addRow("显卡：", self.settingsGpuLabel)
         layout.addWidget(settingsCard)
         self.settingsInfoLabel = qt.QLabel(
-            "高级信息只用于技术人员排查环境问题。患者身份不会写入实验记录；病例 ID 只允许使用匿名 case_… 标识。"
+            "简洁模式默认开启。患者身份不会写入实验记录；病例 ID 只允许使用匿名 case_… 标识。"
         )
         self.settingsInfoLabel.setObjectName("resultMessage")
         self.settingsInfoLabel.setWordWrap(True)
         layout.addWidget(self.settingsInfoLabel)
-        self.settingsAdvancedButton = self._secondaryButton("查看高级信息")
+
+        advancedTitle = qt.QLabel("高级功能")
+        advancedTitle.setObjectName("sectionTitle")
+        layout.addWidget(advancedTitle)
+        advancedRow = qt.QHBoxLayout()
+        self.settingsOpenProjectButton = self._secondaryButton("打开项目目录")
+        self.settingsOpenProjectButton.clicked.connect(
+            lambda checked=False: self._openProjectPath(self.projectRoot)
+        )
+        advancedRow.addWidget(self.settingsOpenProjectButton)
+        self.settingsOpenLogButton = self._secondaryButton("查看日志")
+        self.settingsOpenLogButton.clicked.connect(self._openLatestLog)
+        advancedRow.addWidget(self.settingsOpenLogButton)
+        self.settingsOpenModelButton = self._secondaryButton("查看模型目录")
+        self.settingsOpenModelButton.clicked.connect(
+            lambda checked=False: self._openProjectPath(
+                self.projectRoot / "workspace" / "nnUNet_results"
+            )
+        )
+        advancedRow.addWidget(self.settingsOpenModelButton)
+        advancedRow.addStretch(1)
+        layout.addLayout(advancedRow)
+        self.settingsAdvancedButton = self._secondaryButton("查看技术信息")
         self.settingsAdvancedButton.clicked.connect(self._showSettingsAdvanced)
         layout.addWidget(self.settingsAdvancedButton, 0, qt.Qt.AlignLeft)
         layout.addStretch(1)
@@ -1750,7 +1838,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             return False
         if not self._loadCaseAtIndex(index):
             return False
-        if mode == "view" and self._caseStatusForIndex(index) == "已完成":
+        if mode == "view" and self._caseStatusForIndex(index) in {"已标注", "已确认"}:
             self._setStatusMessage("已加载这个病例，可以查看或重新编辑标注。", "success")
         return self._startAnnotation()
 
@@ -1765,11 +1853,13 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             process = qt.QProcess(self.rootWidget)
             environment = qt.QProcessEnvironment.systemEnvironment()
             projectRoot = str(self.projectRoot.resolve())
-            existingPath = environment.value("PYTHONPATH") if hasattr(environment, "value") else ""
-            environment.insert(
-                "PYTHONPATH",
-                projectRoot + (os.pathsep + existingPath if existingPath else ""),
-            )
+            # Slicer embeds its own Python.  Its PYTHONHOME/PYTHONPATH must
+            # not leak into the project's external interpreter, otherwise
+            # Python can mix Slicer's stdlib with the venv and fail with
+            # ``SRE module mismatch`` before any project script starts.
+            environment.remove("PYTHONHOME")
+            environment.remove("PYTHONPATH")
+            environment.insert("PYTHONPATH", projectRoot)
             environment.insert("nnUNet_raw", str((self.projectRoot / "workspace" / "nnUNet_raw").resolve()))
             environment.insert("nnUNet_preprocessed", str((self.projectRoot / "workspace" / "nnUNet_preprocessed").resolve()))
             environment.insert("nnUNet_results", str((self.projectRoot / "workspace" / "nnUNet_results").resolve()))
@@ -2008,10 +2098,13 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         if self._environmentReport:
             display = environment_display(self._environmentReport)
             self.trainingEnvironmentLabel.setText(
-                "Python 环境　{python}\n"
-                "nnU-Net　{nnunet}\n"
-                "训练数据　{data}\n"
-                "显卡　{gpu}".format(**display)
+                "训练环境：nnU-Net　{nnunet} {nnunet_text}\n"
+                "训练数据：{data_text}\n"
+                "显卡：{gpu_message}".format(
+                    **display,
+                    nnunet_text="已安装" if display["nnunet"] == "✓" else "未安装",
+                    data_text="已准备" if display["data"] == "✓" else "未准备",
+                )
             )
             if display["gpu"] != "✓":
                 self.trainingGpuWarningLabel.setText(
@@ -2028,6 +2121,8 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self.trainingEnvironmentLabel.setText("环境检查失败，请打开高级信息查看原始日志。")
             self.trainingGpuWarningLabel.setText("无法确认当前电脑是否适合正式训练。")
         self._refreshTrainingPage()
+        if self._mainPage == "settings":
+            self._refreshSettingsPage()
         if exitCode == 0 and self._environmentReport:
             self._setStatusMessage("系统检查完成。", "success")
         else:
@@ -2035,8 +2130,10 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
 
     def _finishDatasetValidation(self, exitCode):
         self._validationRows = read_validation_csv(self.projectRoot / "workspace" / "reports" / "dataset_validation.csv")
-        self._validationPassed = bool(self._validationRows) and exitCode == 0 and all(
-            str(row.get("status")) == "PASS" for row in self._validationRows
+        inventory, _ = self._inventoryAndCounts()
+        self._validationPassed = (
+            exitCode == 0
+            and self._validationPassesVerifiedInventory(inventory)
         )
         self._setDatasetSteps(1 if self._validationPassed else 0)
         self._refreshDatasetPage()
@@ -2054,7 +2151,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
                 issue = row.get("errors") or "需要人工确认"
                 details.append(f"{row.get('case_id', '未知病例')}：{issue}")
             if not failed:
-                details.append("没有找到可用于训练的已标注病例。")
+                details.append("没有找到可用于训练的已确认病例。")
             self._setResultMessage(self.datasetResultLabel, "\n".join(details), "warning")
             self._setStatusMessage("数据检查未通过，正式实验暂时不能开始。", "warning")
 
@@ -2065,7 +2162,15 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             splitCount = len(read_splits(splitPath)) if splitPath.exists() else 0
         except Exception:
             splitCount = 0
-        self._datasetPrepared = exitCode == 0 and datasetPath.exists() and splitCount == len(FOLDS)
+        inventory, counts = self._inventoryAndCounts()
+        self._validationPassed = self._validationPassesVerifiedInventory(inventory)
+        self._datasetPrepared = (
+            exitCode == 0
+            and datasetPath.exists()
+            and splitCount == len(FOLDS)
+            and self._validationPassed
+            and int(counts.get("trainable", 0)) >= len(FOLDS)
+        )
         self._preprocessingPrepared = False
         if self._datasetPrepared:
             self._setDatasetSteps(3)
@@ -2116,24 +2221,105 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self._setDetails(f"病例统计失败\n{type(exc).__name__}: {exc}")
         return inventory, case_counts(inventory, validation_rows=self._validationRows)
 
+    def _refreshDerivedProjectState(self, inventory, counts):
+        """Re-read persisted dataset state so the homepage is not stale."""
+
+        self._validationPassed = self._validationPassesVerifiedInventory(inventory)
+        datasetPath = (
+            self.projectRoot
+            / "workspace"
+            / "nnUNet_raw"
+            / "Dataset501_CondyleMRI"
+            / "dataset.json"
+        )
+        splitPath = (
+            self.projectRoot
+            / "workspace"
+            / "nnUNet_preprocessed"
+            / "Dataset501_CondyleMRI"
+            / "splits_final.json"
+        )
+        splitCount = 0
+        if splitPath.exists():
+            try:
+                splitCount = len(read_splits(splitPath))
+            except Exception:
+                splitCount = 0
+        self._datasetPrepared = bool(
+            datasetPath.exists()
+            and splitCount == len(FOLDS)
+            and self._validationPassed
+            and int(counts.get("trainable", 0)) >= len(FOLDS)
+        )
+        fingerprintPath = (
+            self.projectRoot
+            / "workspace"
+            / "nnUNet_preprocessed"
+            / "Dataset501_CondyleMRI"
+            / "dataset_fingerprint.json"
+        )
+        plansPath = (
+            self.projectRoot
+            / "workspace"
+            / "nnUNet_preprocessed"
+            / "Dataset501_CondyleMRI"
+            / "nnUNetPlans.json"
+        )
+        self._preprocessingPrepared = bool(
+            self._datasetPrepared
+            and fingerprintPath.exists()
+            and plansPath.exists()
+        )
+
+    def _validationPassesVerifiedInventory(self, inventory=None):
+        """Reject stale or non-VERIFIED reports before enabling training."""
+
+        rows = list(inventory) if inventory is not None else self._inventoryAndCounts()[0]
+        verified_ids = {
+            str(item.get("case_id"))
+            for item in rows
+            if bool(item.get("verified"))
+        }
+        report_ids = {
+            str(item.get("case_id"))
+            for item in self._validationRows
+        }
+        if not verified_ids or report_ids != verified_ids:
+            return False
+        return all(
+            str(item.get("status")) == "PASS"
+            and str(item.get("annotation_status", "")).upper() == "VERIFIED"
+            for item in self._validationRows
+        )
+
     def _refreshDatasetPage(self):
         if not hasattr(self, "datasetSummaryLabel"):
             return
         inventory, counts = self._inventoryAndCounts()
+        self._validationPassed = self._validationPassesVerifiedInventory(inventory)
         annotated = int(counts["annotated"])
+        verified = int(counts.get("verified", 0))
         trainable = int(counts["trainable"])
         issues = int(counts["issues"])
         self.datasetSummaryLabel.setText(
-            f"病例总数：{counts['total']}　　已完成标注：{annotated}\n"
-            f"可以训练：{trainable}　　存在问题：{issues}"
+            f"病例总数：{counts['total']}　　人工标注完成：{annotated}\n"
+            f"已验证标注：{verified}　　可用于训练：{trainable}　　检查问题：{issues}"
         )
         self.datasetGuidanceLabel.setText(
-            count_guidance(int(counts["group_count"]))
-            + ("\n同一患者的左右侧会自动放在同一折，避免数据泄漏。" if counts["group_count"] else "")
+            count_guidance(int(counts.get("verified_group_count", 0)))
+            + "\n只有状态为 VERIFIED（已确认）的病例会进入正式训练；同一患者的左右侧会自动放在同一折。"
+        )
+        excluded = int(counts["total"]) - verified
+        self.datasetExcludedLabel.setText(
+            f"未确认病例：{excluded}　这些病例只用于提醒，不会被复制到 nnU-Net 训练数据。"
+            if excluded
+            else "目前所有病例都已确认。"
         )
         self.datasetCaseTable.setRowCount(0)
         validationByCase = {str(row.get("case_id")): row for row in self._validationRows}
         for item in inventory:
+            if str(item.get("annotation_status", "")).upper() != "VERIFIED":
+                continue
             rowIndex = self._qtInt(self.datasetCaseTable, "rowCount")
             self.datasetCaseTable.insertRow(rowIndex)
             validation = validationByCase.get(str(item.get("case_id")), {})
@@ -2183,15 +2369,23 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             return
         if not self._validationRows:
             self._validationRows = read_validation_csv(self.projectRoot / "workspace" / "reports" / "dataset_validation.csv")
-        if self._validationRows:
-            self._validationPassed = all(str(row.get("status")) == "PASS" for row in self._validationRows)
+        inventory, counts = self._inventoryAndCounts()
+        self._validationPassed = self._validationPassesVerifiedInventory(inventory)
         splitPath = self.projectRoot / "workspace" / "nnUNet_preprocessed" / "Dataset501_CondyleMRI" / "splits_final.json"
         datasetPath = self.projectRoot / "workspace" / "nnUNet_raw" / "Dataset501_CondyleMRI" / "dataset.json"
         fingerprintPath = self.projectRoot / "workspace" / "nnUNet_preprocessed" / "Dataset501_CondyleMRI" / "dataset_fingerprint.json"
         plansPath = self.projectRoot / "workspace" / "nnUNet_preprocessed" / "Dataset501_CondyleMRI" / "nnUNetPlans.json"
-        self._datasetPrepared = self._datasetPrepared or (datasetPath.exists() and splitPath.exists())
-        self._preprocessingPrepared = self._preprocessingPrepared or (fingerprintPath.exists() and plansPath.exists())
-        inventory, counts = self._inventoryAndCounts()
+        self._datasetPrepared = bool(
+            datasetPath.exists()
+            and splitPath.exists()
+            and self._validationPassed
+            and int(counts.get("trainable", 0)) >= len(FOLDS)
+        )
+        self._preprocessingPrepared = bool(
+            self._datasetPrepared
+            and fingerprintPath.exists()
+            and plansPath.exists()
+        )
         cudaReady = bool(
             self._environmentReport
             and isinstance(self._environmentReport.get("cuda"), dict)
@@ -2199,8 +2393,8 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         )
         envReady = bool(self._environmentReport and self._environmentReport.get("nnunet_ready"))
         readiness = assess_training_readiness(
-            annotated_cases=int(counts["annotated"]),
-            group_count=int(counts["group_count"]),
+            annotated_cases=int(counts.get("verified", 0)),
+            group_count=int(counts.get("verified_group_count", 0)),
             validation_passed=self._validationPassed,
             environment_ready=envReady,
             gpu_ready=cudaReady,
@@ -2241,7 +2435,8 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             config={
                 "case_count": counts.get("total", 0),
                 "annotated_count": counts.get("annotated", 0),
-                "group_count": counts.get("group_count", 0),
+                "verified_count": counts.get("verified", 0),
+                "group_count": counts.get("verified_group_count", 0),
                 "validation_passed": self._validationPassed,
                 "device": "cuda",
                 "gpu": cuda.get("device_name", "unavailable"),
@@ -2269,8 +2464,8 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             and self._environmentReport["cuda"].get("status") == "PASS"
         )
         readiness = assess_training_readiness(
-            annotated_cases=int(counts["annotated"]),
-            group_count=int(counts["group_count"]),
+            annotated_cases=int(counts.get("verified", 0)),
+            group_count=int(counts.get("verified_group_count", 0)),
             validation_passed=self._validationPassed,
             environment_ready=bool(self._environmentReport.get("nnunet_ready")),
             gpu_ready=cudaReady,
@@ -2278,6 +2473,25 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         )
         if not readiness.formal_ready:
             self._setStatusMessage(readiness.message, "warning")
+            return False
+        summary = training_prerequisite_summary(
+            available_cases=int(counts.get("verified", 0)),
+            patient_groups=int(counts.get("verified_group_count", 0)),
+            validation_passed=self._validationPassed,
+            environment_ready=bool(self._environmentReport.get("nnunet_ready")),
+            gpu_ready=cudaReady,
+            dataset_prepared=self._datasetPrepared,
+        )
+        confirm = qt.QMessageBox(slicer.util.mainWindow())
+        confirm.setIcon(qt.QMessageBox.Information)
+        confirm.setWindowTitle("开始 5 折训练")
+        confirm.setText(str(summary["text"]))
+        beginButton = confirm.addButton("开始", qt.QMessageBox.AcceptRole)
+        cancelButton = confirm.addButton("取消", qt.QMessageBox.RejectRole)
+        confirm.setDefaultButton(cancelButton)
+        self._execDialog(confirm)
+        if confirm.clickedButton() != beginButton:
+            self._setStatusMessage("已取消训练。", "info")
             return False
         runDir = self._ensureExperimentRun(resume=resume)
         self._trainingFoldEvents = {}
@@ -2366,7 +2580,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             return False
         self._refreshTrainingPage()
         _, counts = self._inventoryAndCounts()
-        if not self._validationPassed or int(counts["group_count"]) < len(FOLDS):
+        if not self._validationPassed or int(counts.get("verified_group_count", 0)) < len(FOLDS):
             self._setStatusMessage("请先准备至少 5 个通过检查的不同患者组。", "warning")
             return False
         self.trainingStageLabel.setText("正在运行 CPU 流程检查（不会训练模型，也不会生成指标）…")
@@ -3012,14 +3226,162 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.advancedToggle.setChecked(True)
         self._showDetailsDialog()
 
-    def _refreshSettingsPage(self):
-        if not hasattr(self, "settingsPythonLabel"):
-            return
-        self.settingsPythonLabel.setText(project_python_executable(self.projectRoot))
-        self.settingsDatasetLabel.setText(
-            str(self.projectRoot / "workspace" / "nnUNet_raw" / "Dataset501_CondyleMRI")
+    def _currentSlicerExecutable(self):
+        try:
+            value = getattr(slicer.app, "applicationFilePath")
+            value = value() if callable(value) else value
+            candidate = Path(str(value)).resolve()
+            if candidate.name.lower() == "slicer.exe" and candidate.is_file():
+                return candidate
+            fallback = candidate.parent.parent / "Slicer.exe"
+            if fallback.is_file():
+                return fallback.resolve()
+        except Exception:
+            pass
+        return None
+
+    def _changeSlicerPath(self):
+        selected = self._dialogPath(
+            qt.QFileDialog.getOpenFileName(
+                slicer.util.mainWindow(),
+                "选择 Slicer.exe",
+                str(Path.home()),
+                "Slicer.exe (Slicer.exe);;可执行文件 (*.exe)",
+            )
         )
-        self.settingsWorkspaceLabel.setText(str(self.projectRoot / "workspace"))
+        if not selected:
+            return False
+        path = Path(selected).resolve()
+        if path.name.lower() != "slicer.exe" or not path.is_file():
+            self._setStatusMessage("请选择文件名为 Slicer.exe 的程序。", "warning")
+            return False
+        try:
+            write_slicer_config(path, project_root=self.projectRoot)
+        except Exception as exc:
+            self._setDetails(f"保存 Slicer 路径失败\n{type(exc).__name__}: {exc}")
+            self._setStatusMessage("Slicer 路径没有保存，请重试。", "warning")
+            return False
+        self._setStatusMessage("Slicer 路径已保存；下次启动实验平台会使用这个版本。", "success")
+        self._refreshSettingsPage()
+        return True
+
+    def _redetectSlicer(self):
+        try:
+            candidates = discover_slicer_candidates(project_root=self.projectRoot)
+        except Exception as exc:
+            self._setDetails(f"Slicer 检测失败\n{traceback.format_exc()}")
+            self._setStatusMessage(f"Slicer 检测失败：{exc}", "warning")
+            return False
+        if not candidates:
+            self._setStatusMessage(
+                "没有找到 3D Slicer，请点击“更换”选择 Slicer.exe。", "warning"
+            )
+            self._refreshSettingsPage()
+            return False
+        chosen = candidates[0]
+        if len(candidates) > 1:
+            labels = [f"{item.path}  [{item.source}]" for item in candidates]
+            selected, accepted = qt.QInputDialog.getItem(
+                slicer.util.mainWindow(),
+                "选择 3D Slicer",
+                "找到多个版本，请选择一个：",
+                labels,
+                0,
+                False,
+            )
+            if not accepted:
+                return False
+            chosen = candidates[labels.index(str(selected))]
+        try:
+            write_slicer_config(chosen.path, project_root=self.projectRoot)
+        except Exception as exc:
+            self._setDetails(f"保存 Slicer 路径失败\n{traceback.format_exc()}")
+            self._setStatusMessage(f"Slicer 路径没有保存：{exc}", "warning")
+            return False
+        self._setStatusMessage("Slicer 检测完成。", "success")
+        self._refreshSettingsPage()
+        return True
+
+    def _openProjectPath(self, path):
+        destination = Path(path)
+        if not destination.exists():
+            self._setStatusMessage("这个目录目前还不存在。完成对应实验后再打开。", "info")
+            return False
+        try:
+            opened = qt.QDesktopServices.openUrl(qt.QUrl.fromLocalFile(str(destination)))
+            if not opened:
+                self._setStatusMessage("系统没有打开这个目录。", "warning")
+            return bool(opened)
+        except Exception:
+            self._setDetails("打开目录失败\n" + traceback.format_exc())
+            self._setStatusMessage("目录没有打开，请查看技术信息。", "warning")
+            return False
+
+    def _openLatestLog(self):
+        candidates = sorted(
+            (
+                path
+                for path in (self.projectRoot / "workspace").rglob("*.log")
+                if path.is_file()
+            ),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
+            return self._openProjectPath(candidates[0])
+        self._setStatusMessage("当前还没有后台任务日志。", "info")
+        self._showDetailsDialog()
+        return False
+
+    def _refreshSettingsPage(self):
+        if not hasattr(self, "settingsSlicerStatusLabel"):
+            return
+        configured = configured_slicer_path(project_root=self.projectRoot)
+        current = self._currentSlicerExecutable()
+        selected = configured or current
+        self._slicerCandidates = discover_slicer_candidates(project_root=self.projectRoot)
+        if selected:
+            self.settingsSlicerStatusLabel.setText("✓ 已找到")
+            self.settingsSlicerVersionLabel.setText(self._slicerVersion())
+            self.settingsSlicerPathLabel.setText("已找到（完整路径已隐藏）")
+        else:
+            self.settingsSlicerStatusLabel.setText("未找到")
+            self.settingsSlicerVersionLabel.setText("—")
+            self.settingsSlicerPathLabel.setText("尚未配置，请点击“更换”")
+        report = self._environmentReport
+        if report:
+            display = environment_display(report)
+            self.settingsTrainingLabel.setText(
+                "nnU-Net　{0} {1}".format(
+                    display["nnunet"],
+                    "已安装" if display["nnunet"] == "✓" else "未安装",
+                )
+            )
+            self.settingsGpuLabel.setText(display["gpu_message"])
+        else:
+            self.settingsTrainingLabel.setText("nnU-Net　尚未检测")
+            self.settingsGpuLabel.setText("尚未检测；进入模型训练页会自动检查。")
+        detailLines = [
+            "平台设置",
+            f"Slicer 配置文件：{slicer_config_path(self.projectRoot)}",
+            f"当前 Slicer：{selected or '未找到'}",
+            f"项目 Python：{project_python_executable(self.projectRoot)}",
+            f"训练数据目录：{self.projectRoot / 'workspace' / 'nnUNet_raw' / 'Dataset501_CondyleMRI'}",
+            f"工作区：{self.projectRoot / 'workspace'}",
+        ]
+        if report:
+            detailLines.append("环境报告：\n" + json.dumps(report, ensure_ascii=False, indent=2))
+        self._setDetails("\n".join(str(line) for line in detailLines))
+
+    def _slicerVersion(self):
+        try:
+            value = getattr(slicer.app, "applicationVersion")
+            value = value() if callable(value) else value
+            if value:
+                return str(value)
+        except Exception:
+            pass
+        return "已安装"
 
     # ------------------------------------------------------------------
     # Module lifecycle and embedded editor
@@ -3330,7 +3692,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             "完成一次实验只需要下面几步：\n\n"
             "1. 导入核磁病例\n"
             "2. 把下颌髁突标出来并保存\n"
-            "3. 准备至少几例已标注病例\n"
+            "3. 准备至少几例已确认病例\n"
             "4. 在“训练数据”中检查并准备训练数据\n"
             "5. 在“模型训练”中开始 5 组交叉验证\n"
             "6. 等待 5 组实验完成\n"
@@ -3343,6 +3705,174 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         text.setObjectName("mutedLabel")
         text.setWordWrap(True)
         layout.addWidget(text)
+        closeButton = self._primaryButton("知道了")
+        closeButton.clicked.connect(lambda checked=False: dialog.accept())
+        layout.addWidget(closeButton)
+        self._execDialog(dialog)
+
+    def _showFirstRunWizardIfNeeded(self):
+        """Orient a first-time user before showing the full workbench."""
+
+        if self._firstRunWizardDialog is not None:
+            try:
+                if self._firstRunWizardDialog.isVisible():
+                    return
+            except Exception:
+                pass
+        try:
+            completed = slicer.app.settings().value(
+                "TMJCondyleAnnotator/firstRunWizardCompleted", ""
+            )
+        except Exception:
+            completed = ""
+        if not should_show_first_run_wizard(completed):
+            return
+
+        dialog = qt.QDialog(slicer.util.mainWindow())
+        self._firstRunWizardDialog = dialog
+        dialog.setWindowTitle("首次使用引导")
+        dialog.setMinimumSize(560, 430)
+        dialog.setStyleSheet(self._styleSheet())
+        layout = qt.QVBoxLayout(dialog)
+        stack = qt.QStackedWidget()
+        layout.addWidget(stack, 1)
+
+        def addPage(eyebrow, title, body):
+            page = qt.QWidget()
+            pageLayout = qt.QVBoxLayout(page)
+            pageLayout.setContentsMargins(24, 24, 24, 18)
+            eyebrowLabel = qt.QLabel(eyebrow)
+            eyebrowLabel.setObjectName("pageEyebrow")
+            pageLayout.addWidget(eyebrowLabel)
+            titleLabel = qt.QLabel(title)
+            titleLabel.setObjectName("pageTitle")
+            pageLayout.addWidget(titleLabel)
+            bodyLabel = qt.QLabel(body)
+            bodyLabel.setObjectName("homePurpose")
+            bodyLabel.setWordWrap(True)
+            pageLayout.addWidget(bodyLabel)
+            pageLayout.addStretch(1)
+            stack.addWidget(page)
+
+        addPage(
+            "欢迎",
+            "这是做什么的？",
+            "这个软件可以先把 MRI 中的下颌髁突标出来，\n"
+            "再用这些标注训练电脑。\n\n"
+            "训练完成以后，\n"
+            "新的 MRI 可以自动分割出下颌髁突，\n"
+            "并显示三维模型。",
+        )
+        addPage(
+            "实验流程",
+            "整个实验只需要几步",
+            "1. 导入病例\n"
+            "2. 标注下颌髁突\n"
+            "3. 准备训练数据\n"
+            "4. 训练模型\n"
+            "5. 查看实验结果\n"
+            "6. 用新的 MRI 自动分割",
+        )
+        addPage(
+            "开始之前",
+            "第一步先做什么？",
+            "先准备并标注一些 MRI。\n\n"
+            "建议先标 5 例检查流程，\n"
+            "确认没有问题后继续增加病例。",
+        )
+
+        footer = qt.QHBoxLayout()
+        neverAgain = qt.QCheckBox("下次不再显示")
+        footer.addWidget(neverAgain)
+        footer.addStretch(1)
+        backButton = self._secondaryButton("上一步")
+        backButton.setVisible(False)
+        footer.addWidget(backButton)
+        nextButton = self._primaryButton("下一步")
+        footer.addWidget(nextButton)
+        startButton = self._primaryButton("开始")
+        startButton.setVisible(False)
+        footer.addWidget(startButton)
+        layout.addLayout(footer)
+
+        def stackCount():
+            value = stack.count
+            return int(value() if callable(value) else value)
+
+        def stackIndex():
+            value = stack.currentIndex
+            return int(value() if callable(value) else value)
+
+        def updateButtons(index):
+            backButton.setVisible(index > 0)
+            nextButton.setVisible(index < stackCount() - 1)
+            startButton.setVisible(index == stackCount() - 1)
+
+        def goNext(checked=False):
+            index = min(stackIndex() + 1, stackCount() - 1)
+            stack.setCurrentIndex(index)
+            updateButtons(index)
+
+        def goBack(checked=False):
+            index = max(stackIndex() - 1, 0)
+            stack.setCurrentIndex(index)
+            updateButtons(index)
+
+        def begin(checked=False):
+            if neverAgain.isChecked():
+                try:
+                    slicer.app.settings().setValue(
+                        "TMJCondyleAnnotator/firstRunWizardCompleted", "true"
+                    )
+                except Exception:
+                    pass
+            dialog.accept()
+            self._showHome()
+
+        nextButton.clicked.connect(goNext)
+        backButton.clicked.connect(goBack)
+        startButton.clicked.connect(begin)
+        dialog.finished.connect(lambda result=0: setattr(self, "_firstRunWizardDialog", None))
+        updateButtons(0)
+        self._execDialog(dialog)
+
+    def _showDemoDialog(self):
+        """Show a read-only phantom workflow so beginners can learn the UI."""
+
+        dialog = qt.QDialog(slicer.util.mainWindow())
+        dialog.setWindowTitle("软件演示")
+        dialog.setMinimumSize(560, 470)
+        dialog.setStyleSheet(self._styleSheet())
+        layout = qt.QVBoxLayout(dialog)
+        title = qt.QLabel("查看软件演示")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+        notice = qt.QLabel(
+            "这是只读的 synthetic / phantom 流程演示，不读取、不修改真实患者数据，"
+            "也不会把演示内容加入正式训练数据集。"
+        )
+        notice.setObjectName("resultMessage")
+        notice.setWordWrap(True)
+        layout.addWidget(notice)
+        steps = qt.QListWidget()
+        steps.addItems(
+            [
+                "✓ 1　导入病例（演示）",
+                "✓ 2　标注下颌髁突（演示）",
+                "○ 3　确认标注后准备训练数据",
+                "○ 4　训练 5 折模型",
+                "○ 5　查看 Dice / IoU / HD95",
+                "○ 6　导入新的 MRI 自动分割并查看 3D",
+            ]
+        )
+        steps.setEnabled(False)
+        layout.addWidget(steps, 1)
+        explanation = qt.QLabel(
+            "正式操作时，请按首页的“下一步”按钮进行。只有“已确认”的人工标注才会进入训练。"
+        )
+        explanation.setObjectName("mutedLabel")
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
         closeButton = self._primaryButton("知道了")
         closeButton.clicked.connect(lambda checked=False: dialog.accept())
         layout.addWidget(closeButton)
@@ -3471,7 +4001,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
                             visible = bool(widget.isVisible())
                         except Exception:
                             visible = True
-                            self._simpleModeTargets.append((widget, visible))
+                        self._simpleModeTargets.append((widget, visible))
                         existing.add(widgetId)
                     try:
                         widget.setVisible(False)
@@ -3568,6 +4098,24 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
     def _goHome(self, checked=False):
         return self._showHome()
 
+    def _runHomeNextAction(self, checked=False):
+        inventory, counts = self._inventoryAndCounts()
+        action = self._homeNextAction(counts)
+        if action.key == "cases":
+            self._showMainPage("cases")
+            if counts.get("total", 0) and action.button != "开始导入病例":
+                self._continueLastAnnotation()
+            return True
+        if action.key == "dataset":
+            return self._showMainPage("dataset")
+        if action.key == "training":
+            return self._showMainPage("training")
+        if action.key == "results":
+            return self._showMainPage("results")
+        if action.key == "prediction":
+            return self._showMainPage("prediction")
+        return False
+
     def _startNewAnnotationFromHome(self, checked=False):
         self._showPage(0)
         self._setStatusMessage("请选择一份核磁文件，或导入病例文件夹。", "info")
@@ -3583,7 +4131,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             return
         target = 0
         for index in range(len(self._caseFiles)):
-            if self._caseStatusForIndex(index) != "已完成":
+            if self._caseStatusForIndex(index) != "已确认":
                 target = index
                 break
         if self._loadCaseAtIndex(target):
@@ -3610,9 +4158,9 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         completed = 0
         for index, path in enumerate(self._caseFiles):
             status = self._caseStatusForIndex(index)
-            if status == "已完成":
+            if status in {"已标注", "已确认"}:
                 completed += 1
-            if onlyCompleted and status != "已完成":
+            if onlyCompleted and status not in {"已标注", "已确认"}:
                 continue
             item = qt.QListWidgetItem(
                 f"{self._caseIdForIndex(path, index)}    {self._statusSymbol(status)} {status}"
@@ -3649,7 +4197,14 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
 
     @staticmethod
     def _statusSymbol(status):
-        return {"已完成": "✓", "标注中": "●", "未开始": "○"}.get(status, "○")
+        return {
+            "已确认": "✓",
+            "已标注": "●",
+            "标注中": "●",
+            "未验证": "!",
+            "未标注": "○",
+            "未开始": "○",
+        }.get(status, "○")
 
     def _startAnnotation(self):
         volume = self._requireVolume()
@@ -3973,6 +4528,11 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self._saved = self._outputPath().exists()
         self._annotationHasData = False
         self._qcStatus = "未检查"
+        self._currentAnnotationStatus = self._manifestStatusForCase(self._currentCaseId)
+        if not self._currentAnnotationStatus:
+            self._currentAnnotationStatus = "ANNOTATED" if self._saved else "NEW"
+        if self._saved and self._currentAnnotationStatus in {"NEW", "ANNOTATING"}:
+            self._currentAnnotationStatus = "UNVERIFIED"
         self._currentPage = 0
         self._homeVisible = False
         self._threeDVisible = False
@@ -4037,6 +4597,17 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
 
     def _outputPath(self):
         return self.labelsDir / f"{self._currentCaseId}.nii.gz"
+
+    def _manifestStatusForCase(self, caseId):
+        try:
+            rows = read_manifest(self.manifestPath)
+        except Exception:
+            return ""
+        row = next((item for item in rows if item.get("case_id") == caseId), None)
+        if not row:
+            return ""
+        status = str(row.get("annotation_status") or "").strip().upper()
+        return status if status in {"NEW", "ANNOTATING", "ANNOTATED", "VERIFIED", "UNVERIFIED"} else "UNVERIFIED"
 
     def _moveCase(self, delta):
         self._refreshCaseFiles()
@@ -4143,13 +4714,27 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         path = self._caseFiles[index]
         if self._currentCasePath and Path(path).resolve() == self._currentCasePath:
             if self._saved and not self._dirty:
-                return "已完成"
+                return {
+                    "VERIFIED": "已确认",
+                    "UNVERIFIED": "未验证",
+                    "ANNOTATED": "已标注",
+                }.get(
+                    self._currentAnnotationStatus,
+                    "未验证" if self._annotationHasData else "未标注",
+                )
             if self._foregroundVoxelCount() > 0:
                 return "标注中"
         caseId = self._caseIdForIndex(path, index)
-        if (self.labelsDir / f"{caseId}.nii.gz").exists():
-            return "已完成"
-        return "未开始"
+        status = self._manifestStatusForCase(caseId)
+        if status == "VERIFIED" and (self.labelsDir / f"{caseId}.nii.gz").exists():
+            return "已确认"
+        if status == "ANNOTATED" and (self.labelsDir / f"{caseId}.nii.gz").exists():
+            return "已标注"
+        if status == "UNVERIFIED" or (self.labelsDir / f"{caseId}.nii.gz").exists():
+            return "未验证"
+        if status == "ANNOTATING":
+            return "标注中"
+        return "未标注"
 
     def _applySegmentationDisplaySettings(self):
         if not self.segmentationNode:
@@ -4184,6 +4769,10 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         path = self._outputPath()
         if not path.exists() or not self.segmentationNode:
             return
+        if not self._currentAnnotationStatus or self._currentAnnotationStatus == "NEW":
+            # A mask without a trustworthy manifest record is never treated as
+            # a verified training label.
+            self._currentAnnotationStatus = "UNVERIFIED"
         labelNode = None
         try:
             loaded = slicer.util.loadLabelVolume(str(path), returnNode=True)
@@ -4270,6 +4859,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             return
         self._dirty = True
         self._saved = False
+        self._currentAnnotationStatus = "ANNOTATED"
         self._annotationHasData = self._foregroundVoxelCount() > 0
         self._qcStatus = "未检查"
         self._threeDVisible = False
@@ -5066,12 +5656,13 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
                 status="ANNOTATED",
                 warnings=[],
             )
+            self._currentAnnotationStatus = "ANNOTATED"
             self._saved = True
             self._dirty = False
             self._annotationHasData = True
             self._qcStatus = "通过"
             completed = sum(
-                self._caseStatusForIndex(index) == "已完成"
+                self._caseStatusForIndex(index) in {"已标注", "已确认"}
                 for index in range(len(self._caseFiles))
             )
             self.saveSuccessLabel.setVisible(True)
@@ -5083,12 +5674,13 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             )
             if len(self._caseFiles) <= 1:
                 nextGuidance = (
-                    "这一例已经完成。\n"
+                    "这一例已经保存，但还没有确认。\n"
+                    "请点击“确认本例标注”，确认后才能用于训练。\n"
                     "如果还有其它病例，可以继续导入和标注。\n"
                     "建议先完成至少 5 例进行第一次检查，之后再继续标更多病例。"
                 )
             elif completed == len(self._caseFiles):
-                nextGuidance = "全部病例已经完成。"
+                nextGuidance = "所有病例都已保存；请逐例点击“确认本例标注”后再准备训练数据。"
             else:
                 nextGuidance = (
                     f"已完成 {completed} / {len(self._caseFiles)} 例。\n"
@@ -5122,6 +5714,54 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
                 except Exception:
                     pass
 
+    def _confirmAnnotation(self):
+        if not self._saved or self._dirty or not self._annotationHasData:
+            self._setStatusMessage("请先保存并完成技术检查，再确认本例标注。", "warning")
+            return False
+        if self._currentAnnotationStatus == "VERIFIED":
+            self._setStatusMessage("本例已经确认，可以用于训练。", "info")
+            return True
+        box = qt.QMessageBox(slicer.util.mainWindow())
+        box.setIcon(qt.QMessageBox.Question)
+        box.setWindowTitle("确认本例标注")
+        box.setText("确认后，这一例可以用于训练。")
+        box.setInformativeText("请确认你已经完成医学复核，并且三维轮廓没有明显错误。")
+        confirmButton = box.addButton("确认并用于训练", qt.QMessageBox.AcceptRole)
+        cancelButton = box.addButton("取消", qt.QMessageBox.RejectRole)
+        box.setDefaultButton(cancelButton)
+        self._execDialog(box)
+        if box.clickedButton() != confirmButton:
+            return False
+        try:
+            self._upsertManifest(
+                case_id=self._currentCaseId,
+                volume=self.volumeNode,
+                labelPath=self._outputPath(),
+                status="VERIFIED",
+                warnings=[],
+            )
+            self._currentAnnotationStatus = "VERIFIED"
+            self._setResultMessage(
+                self.saveResultLabel,
+                f"✓ {self._currentCaseId} 已确认，可以用于训练",
+                "success",
+            )
+            self._setResultMessage(
+                self.saveNextGuidanceLabel,
+                "本例已经进入可训练病例。可以继续确认其它病例，或返回首页查看下一步。",
+                "success",
+            )
+            self.confirmAnnotationHintLabel.setText(
+                "✓ 本例已确认，可以用于训练。重新编辑后需要再次确认。"
+            )
+            self._setStatusMessage("本例标注已确认，可以用于训练。", "success")
+            self._syncUi()
+            return True
+        except Exception:
+            self._setDetails("确认标注失败\n" + traceback.format_exc())
+            self._setStatusMessage("确认状态没有保存，请重试。", "warning")
+            return False
+
     # ------------------------------------------------------------------
     # Manifest and unsaved protection
     # ------------------------------------------------------------------
@@ -5154,9 +5794,10 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             "image_path": imagePath,
             "label_path": self._manifestPath(labelPath),
             "annotation_status": status,
-            "geometry_valid": "true" if status == "ANNOTATED" else existing.get("geometry_valid", ""),
-            "label_valid": "true" if status == "ANNOTATED" else existing.get("label_valid", ""),
-            "notes": "由 TMJ Condyle Annotator 保存。"
+            "geometry_valid": "true" if status in {"ANNOTATED", "VERIFIED"} else existing.get("geometry_valid", ""),
+            "label_valid": "true" if status in {"ANNOTATED", "VERIFIED"} else existing.get("label_valid", ""),
+            "notes": "由下颌髁突三维分割实验平台保存。"
+            + (" 已由用户确认。" if status == "VERIFIED" else "")
             + (" " + " ".join(warnings) if warnings else ""),
         }
         rows = [row for row in rows if row.get("case_id") != case_id]
@@ -5308,8 +5949,17 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
     # ------------------------------------------------------------------
     def _statusText(self):
         if self._saved and not self._dirty:
-            return "已完成"
+            return {
+                "VERIFIED": "已确认",
+                "UNVERIFIED": "未验证",
+                "ANNOTATED": "已标注",
+            }.get(
+                self._currentAnnotationStatus,
+                "未验证" if self._annotationHasData else "未标注",
+            )
         if self._annotationHasData:
+            return "标注中"
+        if self._currentAnnotationStatus == "ANNOTATING":
             return "标注中"
         return "未标注"
 
@@ -5358,10 +6008,12 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
 
         if hasattr(self, "homeProgressLabel"):
             inventory, counts = self._inventoryAndCounts()
+            self._refreshDerivedProjectState(inventory, counts)
             completed = int(counts["annotated"])
+            verified = int(counts.get("verified", 0))
             total = int(counts["total"])
             self.homeProgressLabel.setText(
-                f"病例进度：{total} 个病例　　已完成：{completed}　　未完成：{total - completed}"
+                f"病例进度：{total} 个病例　　人工标注完成：{completed}　　已确认：{verified}"
                 if total
                 else "还没有导入病例。"
             )
@@ -5373,23 +6025,57 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self.homeResultsButton.setEnabled(True)
             self.homePredictButton.setEnabled(True)
             self.homeStatLabels["total"].setText(str(total))
-            self.homeStatLabels["annotated"].setText(str(completed))
+            self.homeStatLabels["manual"].setText(str(completed))
+            self.homeStatLabels["verified"].setText(str(verified))
             self.homeStatLabels["trainable"].setText(str(counts["trainable"]))
+            foldStates = detect_fold_states(
+                fold_results_directory(
+                    results_root=self.projectRoot / "workspace" / "nnUNet_results"
+                )
+            )
+            modelReady = all(state.completed for state in foldStates)
+            hasIncomplete = any(state.resumable for state in foldStates)
             self.homeStatLabels["training"].setText(
                 "进行中" if self._processKind in {"training", "oof", "evaluation"}
-                else "已完成" if all(state.completed for state in detect_fold_states(fold_results_directory(results_root=self.projectRoot / "workspace" / "nnUNet_results")))
+                else "已完成" if modelReady
+                else "未完成" if hasIncomplete
                 else "未开始"
             )
             self.homeStatLabels["results"].setText(
-                "可查看" if has_evaluation_results(self.projectRoot / "workspace" / "reports") or list_experiment_runs(self.projectRoot / "workspace") else "暂无"
+                "可查看" if has_evaluation_results(self.projectRoot / "workspace" / "reports") else "暂无"
             )
             self.homeStatLabels["model"].setText(
-                "已准备" if all(state.completed for state in detect_fold_states(fold_results_directory(results_root=self.projectRoot / "workspace" / "nnUNet_results"))) else "暂无"
+                "已准备" if modelReady else "暂无"
             )
-            self.homeNextStepLabel.setText(self._homeNextStep(counts))
+            action = self._homeNextAction(counts)
+            self.homeNextStepLabel.setText(action.message)
+            self.homeNextActionButton.setText(action.button)
+            self.homeWorkflowLabel.setText(
+                "病例：{manual} / {total} 已完成人工标注，{verified} 例已确认\n"
+                "训练数据：{dataset}\n"
+                "模型训练：{training}\n"
+                "实验结果：{results}\n"
+                "自动分割：{prediction}".format(
+                    manual=completed,
+                    total=total,
+                    verified=verified,
+                    dataset="已准备" if self._datasetPrepared else "未准备",
+                    training=(
+                        "进行中"
+                        if self._processKind in {"training", "oof", "evaluation"}
+                        else "已完成"
+                        if modelReady
+                        else "未完成"
+                        if hasIncomplete
+                        else "未开始"
+                    ),
+                    results="可查看" if has_evaluation_results(self.projectRoot / "workspace" / "reports") else "暂无",
+                    prediction="可以使用" if modelReady else "等待模型",
+                )
+            )
 
-        statusState = "complete" if status == "已完成" else "working" if status == "标注中" else ""
-        statusPrefix = "✓ " if status == "已完成" else "● "
+        statusState = "complete" if status in {"已确认", "已标注"} else "working" if status == "标注中" else "warning" if status == "未验证" else ""
+        statusPrefix = "✓ " if status in {"已确认", "已标注"} else "● "
         self.statusChip.setText(statusPrefix + status)
         self.statusChip.setProperty("status", statusState)
         self.statusChip.style().unpolish(self.statusChip)
@@ -5431,6 +6117,15 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.saveButton.setEnabled(
             hasSegmentation and self._qcStatus == "通过"
         )
+        self.confirmAnnotationButton.setEnabled(
+            bool(self._saved and not self._dirty and self._annotationHasData)
+            and self._currentAnnotationStatus != "VERIFIED"
+        )
+        self.confirmAnnotationButton.setText(
+            "已确认本例标注"
+            if self._currentAnnotationStatus == "VERIFIED"
+            else "确认本例标注"
+        )
         self.previousCaseButton.setEnabled(
             bool(self._caseFiles) and self._currentCaseIndex > 0
         )
@@ -5453,12 +6148,17 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self._refreshPredictionPage()
 
     def _homeNextStep(self, counts):
+        return self._homeNextAction(counts).message
+
+    def _homeNextAction(self, counts):
         states = detect_fold_states(
             fold_results_directory(results_root=self.projectRoot / "workspace" / "nnUNet_results")
         )
-        return home_next_step(
+        return home_next_action(
             total_cases=int(counts.get("total", 0)),
             annotated_cases=int(counts.get("annotated", 0)),
+            verified_cases=int(counts.get("verified", 0)),
+            verified_group_count=int(counts.get("verified_group_count", 0)),
             validation_passed=self._validationPassed,
             dataset_prepared=self._datasetPrepared,
             training_active=self._processKind in {"training", "oof", "evaluation"},
@@ -5473,7 +6173,8 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             f"病例：{self._currentCaseId}\n"
                 f"✓ 病例已导入\n"
                 f"✓ 已完成标注\n"
-                "✓ 技术检查完成"
+                "✓ 技术检查完成\n"
+                + ("✓ 本例已确认，可用于训练" if self._currentAnnotationStatus == "VERIFIED" else "○ 尚未确认，暂不能用于训练")
             )
 
 

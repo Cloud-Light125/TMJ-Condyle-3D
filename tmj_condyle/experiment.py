@@ -43,7 +43,11 @@ FOLDS = tuple(range(N_FOLDS))
 FORMAL_TRAINING_DEVICE = "cuda"
 TRAINER = "nnUNetTrainer"
 PLANS = "nnUNetPlans"
-CASE_COMPLETE_STATUSES = {"ANNOTATED", "VERIFIED"}
+ANNOTATION_COMPLETE_STATUSES = {"ANNOTATED", "VERIFIED"}
+TRAINING_STATUSES = {"VERIFIED"}
+# Kept as a compatibility name for callers that use it to mean “the annotator
+# has exported a mask”.  Formal training uses TRAINING_STATUSES below.
+CASE_COMPLETE_STATUSES = ANNOTATION_COMPLETE_STATUSES
 
 _NIFTI_SUFFIXES = (".nii.gz", ".nii", ".nrrd")
 _FOLD_MARKER = re.compile(
@@ -102,6 +106,18 @@ class FoldState:
         }
 
 
+@dataclass(frozen=True)
+class HomeAction:
+    """The next novice-facing action shown on the project home page."""
+
+    key: str
+    message: str
+    button: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"key": self.key, "message": self.message, "button": self.button}
+
+
 def _case_id_from_filename(path: Path) -> str:
     for suffix in _NIFTI_SUFFIXES:
         if path.name.lower().endswith(suffix):
@@ -130,12 +146,12 @@ def load_case_inventory(
     images_dir: str | Path = NIFTI_DIR,
     labels_dir: str | Path = LABELS_DIR,
 ) -> list[dict[str, object]]:
-    """Return anonymous case rows for the GUI case list.
+    """Return anonymous case rows for the GUI and training readiness checks.
 
-    A row is considered trainable only when its manifest status is annotated
-    or verified and a label file is present.  Pixel/geometry QC remains the
-    responsibility of ``validate_dataset.py``; this function never upgrades a
-    case to ready based on a filename alone.
+    ``ANNOTATED`` means that the annotator exported a mask.  It is deliberately
+    not enough for formal training: only ``VERIFIED`` rows are trainable.  A
+    label file with no trustworthy status is surfaced as ``UNVERIFIED`` rather
+    than silently promoted based on its filename.
     """
 
     manifest_rows = read_manifest(manifest_path)
@@ -157,11 +173,30 @@ def load_case_inventory(
         label_path = resolve_project_path(str(label_value)) if label_value else Path("")
         image_exists = bool(str(image_path)) and image_path.is_file()
         label_exists = bool(str(label_path)) and label_path.is_file()
-        annotation_status = str(row.get("annotation_status") or "").strip()
-        trainable = annotation_status in CASE_COMPLETE_STATUSES and label_exists and image_exists
-        if trainable:
+        annotation_status = str(row.get("annotation_status") or "").strip().upper()
+        if label_exists and annotation_status not in {
+            "NEW",
+            "ANNOTATING",
+            "ANNOTATED",
+            "VERIFIED",
+            "UNVERIFIED",
+        }:
+            annotation_status = "UNVERIFIED"
+        trainable = (
+            annotation_status in TRAINING_STATUSES and label_exists and image_exists
+        )
+        manual_complete = (
+            annotation_status in ANNOTATION_COMPLETE_STATUSES
+            and label_exists
+            and image_exists
+        )
+        if annotation_status == "VERIFIED" and manual_complete:
+            status = "已确认"
+        elif annotation_status == "ANNOTATED" and manual_complete:
             status = "已标注"
-        elif annotation_status == "ANNOTATING" or label_exists:
+        elif annotation_status == "UNVERIFIED" or label_exists and not annotation_status:
+            status = "未验证"
+        elif annotation_status == "ANNOTATING":
             status = "标注中"
         elif image_exists:
             status = "未标注"
@@ -170,10 +205,12 @@ def load_case_inventory(
         problems: list[str] = []
         if not image_exists:
             problems.append("没有 MRI")
-        if annotation_status in CASE_COMPLETE_STATUSES and not label_exists:
+        if annotation_status in ANNOTATION_COMPLETE_STATUSES and not label_exists:
             problems.append("没有标注文件")
-        if label_exists and annotation_status not in CASE_COMPLETE_STATUSES:
-            problems.append("标注状态未完成")
+        if label_exists and annotation_status not in ANNOTATION_COMPLETE_STATUSES:
+            problems.append("标注尚未确认")
+        if annotation_status == "UNVERIFIED":
+            problems.append("来源未确认，不能用于训练")
         inventory.append(
             {
                 "case_id": case_id,
@@ -183,6 +220,8 @@ def load_case_inventory(
                 "label_path": str(label_path) if label_exists else str(row.get("label_path") or ""),
                 "annotation_status": annotation_status,
                 "status": status,
+                "manual_complete": manual_complete,
+                "verified": annotation_status == "VERIFIED" and manual_complete,
                 "trainable": trainable,
                 "problems": problems,
             }
@@ -195,30 +234,62 @@ def case_counts(
     *,
     validation_rows: Iterable[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
-    """Calculate homepage/dataset counters without inventing validation."""
+    """Calculate homepage/dataset counters without inventing validation.
+
+    ``annotated`` remains an alias for the older API and means completed
+    manual exports.  ``verified`` and ``trainable`` are the safety boundary for
+    formal training; both exclude ANNOTATED, NEW, ANNOTATING and UNVERIFIED.
+    """
 
     rows = list(inventory)
-    ready = [row for row in rows if bool(row.get("trainable"))]
+    manual = [row for row in rows if bool(row.get("manual_complete"))]
+    verified = [row for row in rows if bool(row.get("verified"))]
     validation = list(validation_rows or [])
     validation_passed = {
         str(row.get("case_id"))
         for row in validation
         if str(row.get("status")) == "PASS"
+        and str(row.get("annotation_status", "")).upper() == "VERIFIED"
     }
-    validation_failed = [row for row in validation if str(row.get("status")) == "FAIL"]
-    groups = {str(row.get("group_id") or row.get("case_id")) for row in ready}
+    validation_failed = [
+        row
+        for row in validation
+        if str(row.get("status")) == "FAIL"
+        and str(row.get("annotation_status", "")).upper() == "VERIFIED"
+    ]
+    verified_ids = {str(row.get("case_id")) for row in verified}
+    trainable_ids = verified_ids & validation_passed if validation else verified_ids
+    groups = {
+        str(row.get("group_id") or row.get("case_id"))
+        for row in verified
+        if str(row.get("case_id")) in trainable_ids
+    }
+    unverified = [
+        row
+        for row in rows
+        if str(row.get("annotation_status", "")).upper() == "UNVERIFIED"
+        or (row.get("label_path") and not bool(row.get("verified")))
+    ]
     return {
         "total": len(rows),
-        "annotated": len(ready),
-        "trainable": (
-            sum(str(row.get("case_id")) in validation_passed for row in ready)
-            if validation
-            else len(ready)
-        ),
+        "annotated": len(manual),
+        "manual_annotated": len(manual),
+        "verified": len(verified),
+        "unverified": len(unverified),
+        "trainable": len(trainable_ids),
         "group_count": len(groups),
+        "verified_group_count": len(
+            {
+                str(row.get("group_id") or row.get("case_id"))
+                for row in verified
+            }
+        ),
         "issues": len(validation_failed),
         "validation_checked": bool(validation),
-        "validation_passed": bool(validation) and not validation_failed,
+        "validation_passed": bool(verified)
+        and bool(validation)
+        and verified_ids.issubset(validation_passed)
+        and not validation_failed,
         "cases": rows,
     }
 
@@ -236,6 +307,88 @@ def count_guidance(group_count: int) -> str:
     return "病例数量充足，可以正常进行 5 折实验。"
 
 
+def home_next_action(
+    *,
+    total_cases: int,
+    annotated_cases: int,
+    validation_passed: bool = False,
+    dataset_prepared: bool = False,
+    training_active: bool = False,
+    model_ready: bool = False,
+    results_ready: bool = False,
+    verified_cases: int | None = None,
+    verified_group_count: int | None = None,
+) -> HomeAction:
+    """Return the homepage's next action for a novice user.
+
+    ``annotated_cases`` is the completed manual count.  The optional verified
+    values make the safety boundary explicit while keeping old callers that
+    only know one count compatible.
+    """
+
+    annotated = int(annotated_cases)
+    total = int(total_cases)
+    verified = annotated if verified_cases is None else int(verified_cases)
+    verified_groups = (
+        verified
+        if verified_group_count is None
+        else int(verified_group_count)
+    )
+    if training_active:
+        return HomeAction(
+            "training",
+            "下一步：等待后台实验完成；你仍然可以继续查看病例标注。",
+            "查看训练进度",
+        )
+    if model_ready:
+        if results_ready:
+            return HomeAction(
+                "prediction",
+                "实验结果已完成。下一步：查看 Dice / IoU / HD95，或使用新 MRI 自动分割。",
+                "自动分割新病例",
+            )
+        return HomeAction(
+            "results",
+            "模型训练完成，下一步：查看真实 OOF 评价结果。",
+            "查看实验结果",
+        )
+    if dataset_prepared:
+        return HomeAction(
+            "training",
+            "训练数据已经准备完成。下一步：进入模型训练开始实验。",
+            "开始训练",
+        )
+    if annotated == 0:
+        return HomeAction(
+            "cases",
+            "下一步：先导入核磁病例，并标注下颌髁突。",
+            "开始导入病例",
+        )
+    if annotated < len(FOLDS):
+        return HomeAction(
+            "cases",
+            f"下一步：继续标注更多病例（也可以继续导入）。当前已完成 {annotated} 例，建议先标 5 例检查流程。",
+            "继续标注",
+        )
+    if verified < len(FOLDS) or verified_groups < len(FOLDS):
+        return HomeAction(
+            "cases",
+            f"已有 {annotated} 例完成标注，但只有 {verified} 例已确认。请确认标注后再准备训练数据。",
+            "确认标注",
+        )
+    if not validation_passed:
+        return HomeAction(
+            "dataset",
+            f"已有 {verified} 个已确认病例。下一步：进入训练数据检查并准备 5 折实验。",
+            "准备训练数据",
+        )
+    return HomeAction(
+        "dataset",
+        f"已有 {total} 个病例，已确认病例已经达到 5 折要求。下一步：准备训练数据。",
+        "准备训练数据",
+    )
+
+
 def home_next_step(
     *,
     total_cases: int,
@@ -245,27 +398,78 @@ def home_next_step(
     training_active: bool = False,
     model_ready: bool = False,
     results_ready: bool = False,
+    verified_cases: int | None = None,
+    verified_group_count: int | None = None,
 ) -> str:
-    """Return the homepage's next action for a novice user."""
+    """Compatibility wrapper returning only the user-facing sentence."""
 
-    annotated = int(annotated_cases)
-    total = int(total_cases)
-    if annotated == 0:
-        return "下一步：先导入核磁病例，并标注下颌髁突。"
-    if not validation_passed or not dataset_prepared:
-        if annotated < len(FOLDS):
-            return (
-                f"下一步：继续标注；当前已有 {annotated} 个病例，至少需要 "
-                f"{len(FOLDS)} 个不同患者组才能做 5 折实验。"
-            )
-        return f"下一步：已有 {annotated} 个病例可以训练，进入“训练数据”检查并准备数据。"
-    if training_active:
-        return "下一步：等待后台实验完成；你仍然可以查看病例标注。"
-    if model_ready:
-        if results_ready:
-            return "实验结果已完成。下一步：查看指标，或使用新 MRI 自动分割。"
-        return "模型训练完成，下一步：等待真实 OOF 评价结果。"
-    return f"当前已有 {total} 个病例。下一步：进入“模型训练”开始实验。"
+    return home_next_action(
+        total_cases=total_cases,
+        annotated_cases=annotated_cases,
+        validation_passed=validation_passed,
+        dataset_prepared=dataset_prepared,
+        training_active=training_active,
+        model_ready=model_ready,
+        results_ready=results_ready,
+        verified_cases=verified_cases,
+        verified_group_count=verified_group_count,
+    ).message
+
+
+def should_show_first_run_wizard(completed_value: object) -> bool:
+    """Interpret QSettings values used by the first-run wizard."""
+
+    return str(completed_value or "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "完成",
+    }
+
+
+def training_prerequisite_summary(
+    *,
+    available_cases: int,
+    patient_groups: int,
+    validation_passed: bool,
+    environment_ready: bool,
+    gpu_ready: bool,
+    dataset_prepared: bool,
+) -> dict[str, object]:
+    """Build the plain-language confirmation summary before formal training."""
+
+    cases = int(available_cases)
+    groups = int(patient_groups)
+    reasons: list[str] = []
+    if cases < len(FOLDS):
+        reasons.append(f"可用病例不足 5 例（当前 {cases} 例）")
+    if groups < len(FOLDS):
+        reasons.append(f"不同患者组不足 5 组（当前 {groups} 组）")
+    if not validation_passed:
+        reasons.append("训练数据尚未通过检查")
+    if not environment_ready:
+        reasons.append("nnU-Net 训练环境未准备好")
+    if not dataset_prepared:
+        reasons.append("训练数据尚未生成")
+    if not gpu_ready:
+        reasons.append("当前电脑没有检测到可用于正式训练的 NVIDIA 显卡")
+    return {
+        "available_cases": cases,
+        "patient_groups": groups,
+        "experiment": "5组交叉验证",
+        "model": "3D nnU-Net",
+        "formal_ready": not reasons,
+        "reasons": reasons,
+        "text": (
+            "即将开始实验：\n\n"
+            f"可用病例：{cases}\n"
+            f"患者组：{groups}\n"
+            "实验方式：5组交叉验证\n"
+            "模型：3D nnU-Net\n\n"
+            "训练可能需要较长时间。"
+        ),
+    }
 
 
 def assess_training_readiness(
@@ -481,7 +685,12 @@ def environment_command(*, project_root: str | Path = Path(__file__).resolve().p
 
 
 def dataset_validation_command(*, project_root: str | Path = Path(__file__).resolve().parents[1], python_executable: str | Path | None = None) -> list[str]:
-    return script_command("validate_dataset.py", project_root=project_root, python_executable=python_executable)
+    return script_command(
+        "validate_dataset.py",
+        ["--include-status", "VERIFIED"],
+        project_root=project_root,
+        python_executable=python_executable,
+    )
 
 
 def dataset_build_command(*, project_root: str | Path = Path(__file__).resolve().parents[1], python_executable: str | Path | None = None) -> list[str]:
@@ -805,10 +1014,13 @@ def export_experiment_results(
 
 
 __all__ = [
+    "ANNOTATION_COMPLETE_STATUSES",
     "CASE_COMPLETE_STATUSES",
     "FOLDS",
     "FoldState",
+    "HomeAction",
     "Readiness",
+    "TRAINING_STATUSES",
     "assess_training_readiness",
     "case_counts",
     "completed_folds",
@@ -826,6 +1038,7 @@ __all__ = [
     "folds_needing_training",
     "format_metric",
     "has_evaluation_results",
+    "home_next_action",
     "home_next_step",
     "list_experiment_runs",
     "load_case_inventory",
@@ -842,6 +1055,8 @@ __all__ = [
     "read_validation_csv",
     "script_command",
     "summarize_metrics_by_fold",
+    "should_show_first_run_wizard",
+    "training_prerequisite_summary",
     "training_command",
     "user_training_message",
 ]

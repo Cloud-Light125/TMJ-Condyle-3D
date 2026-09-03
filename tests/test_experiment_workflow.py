@@ -140,7 +140,8 @@ def test_case_inventory_and_counts_use_real_annotation_status(tmp_path):
     counts = case_counts(inventory)
     assert counts["total"] == 2
     assert counts["annotated"] == 1
-    assert counts["trainable"] == 1
+    assert counts["verified"] == 0
+    assert counts["trainable"] == 0
     assert inventory[0]["status"] == "已标注"
     assert inventory[1]["status"] == "数据问题"
 

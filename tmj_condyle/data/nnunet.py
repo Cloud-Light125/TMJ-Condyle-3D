@@ -20,7 +20,6 @@ from ..config import (
 )
 from ..labels.qc import validate_pair
 from ..utils.io import read_image, write_clean_image
-from .manifest import ANNOTATION_STATUSES
 from .splits import build_grouped_splits, write_fold_assignments, write_splits
 
 
@@ -40,7 +39,14 @@ def preprocessed_dataset_folder(
     return Path(nnunet_preprocessed) / dataset_name
 
 
-def _require_training_rows(rows: Iterable[dict[str, str]]) -> list[dict[str, str]]:
+def _require_training_rows(
+    rows: Iterable[dict[str, str]],
+    *,
+    allowed_statuses: set[str] | None = None,
+) -> list[dict[str, str]]:
+    """Select training rows, defaulting to the safety-critical VERIFIED set."""
+
+    allowed = {str(value).upper() for value in (allowed_statuses or {"VERIFIED"})}
     selected: list[dict[str, str]] = []
     seen: set[str] = set()
     for row in rows:
@@ -48,16 +54,16 @@ def _require_training_rows(rows: Iterable[dict[str, str]]) -> list[dict[str, str
         if not case_id or case_id in seen:
             raise ValueError(f"Duplicate or empty case_id in manifest: {case_id!r}")
         seen.add(case_id)
-        status = row.get("annotation_status", "")
-        if status not in {"ANNOTATED", "VERIFIED"}:
+        status = row.get("annotation_status", "").upper()
+        if status not in allowed:
             continue
         if not row.get("image_path") or not row.get("label_path"):
             raise ValueError(f"{case_id} is marked {status} but has no image_path/label_path")
         selected.append(row)
     if not selected:
         raise ValueError(
-            "No verified mandibular condyle masks are available. "
-            "Use 3D Slicer to annotate cases before training."
+            "No VERIFIED mandibular condyle masks are available. "
+            "Confirm the annotation in the TMJ workbench before training."
         )
     return selected
 
@@ -72,10 +78,11 @@ def build_dataset(
     dataset_id: int = DATASET_ID,
     n_splits: int = 5,
     seed: int = 20260902,
+    allowed_statuses: set[str] | None = None,
 ) -> tuple[Path, Path, list[dict[str, list[str]]]]:
-    """Build nnU-Net raw data and grouped splits from annotated manifest rows."""
+    """Build nnU-Net raw data from VERIFIED manifest rows only."""
 
-    selected = _require_training_rows(rows)
+    selected = _require_training_rows(rows, allowed_statuses=allowed_statuses)
     target = dataset_folder(nnunet_raw, dataset_name=dataset_name)
     images_dir = target / "imagesTr"
     labels_dir = target / "labelsTr"

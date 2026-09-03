@@ -1,5 +1,8 @@
 # 3D Slicer 与 SlicerNNUnet 指南
 
+普通用户只需双击项目根目录的“启动实验平台.bat”。下面的 Additional module paths、
+Segment Editor 和 SlicerNNUnet 操作属于开发者/高级排障流程，不是日常使用要求。
+
 ## A. 安装项目标注模块
 
 1. 打开 3D Slicer。

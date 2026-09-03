@@ -19,7 +19,7 @@ MANIFEST_FIELDS = [
     "label_valid",
     "notes",
 ]
-ANNOTATION_STATUSES = {"NEW", "ANNOTATING", "ANNOTATED", "VERIFIED"}
+ANNOTATION_STATUSES = {"NEW", "ANNOTATING", "ANNOTATED", "VERIFIED", "UNVERIFIED"}
 
 
 def read_manifest(path: str | Path = MANIFEST_PATH) -> list[dict[str, str]]:

@@ -1,59 +1,38 @@
 # TMJ-Condyle-3D
 
-面向颞下颌关节 MRI 的单结构三维分割课设/实验平台：
+下颌髁突 MRI 三维分割实验平台
 
-    首页引导病例导入
-      -> 3D Slicer 中文人工标注
-      -> 数据 QC 与训练数据准备
-      -> nnU-Net v2 3d_fullres / grouped 5-fold
-      -> 真实 OOF Dice / IoU / HD95 评价
-      -> 五折 ensemble 自动分割新病例
-      -> GT / Prediction 2D 与 3D 对比
+TMJ MRI 标注、训练、评估与三维分割
 
-本项目只包含一个前景类别：
+## 普通用户使用
 
-    0 = background
-    1 = mandibular_condyle
+1. 安装 3D Slicer。
+2. 双击项目根目录的 **启动实验平台.bat**。
+3. 按软件提示操作。
 
-不包含关节盘、关节窝、颞骨、关节结节、病灶、多分类、SAM 系列、Transformer、
-自定义 loss、attention 改进或自定义网络结构。训练核心只使用官方 nnU-Net v2
-的 3d_fullres 配置。
+启动器会自动寻找 3D Slicer、加载项目模块，并直接进入“下颌髁突三维分割实验平台”。
+不需要打开 PowerShell，不需要配置 Slicer 模块路径，也不需要手工运行 Python 或 nnU-Net 命令。
+
+第一次打开会出现“首次使用引导”，首页会直接告诉你下一步该做什么。可选地双击
+**创建桌面快捷方式.bat**，在桌面创建“下颌髁突三维分割实验平台”快捷方式。
+
+软件内的基本流程是：
+
+    导入 MRI → 标注下颌髁突 → 确认标注 → 准备训练数据
+    → 训练模型 → 查看 Dice / IoU / HD95 → 自动分割新 MRI → 查看 3D
+
+只有“已确认（VERIFIED）”的人工标注才会进入正式训练。没有真实牙科人工标注、兼容训练显卡
+或真实评价文件时，软件会明确显示等待原因，不会生成假 mask 或假指标。
 
 ## 当前真实状态
 
-代码、Slicer 实验平台、数据转换、QC、数据集构建、grouped 5-fold、训练/预测/评价/
-模型导出、实验记录和文档已经建立。当前环境与本地医学数据的实际结果要以
-python scripts/check_environment.py 的输出和 reports/ 下的报告为准。
+本仓库包含 Slicer 实验平台、病例与标注、训练数据准备、nnU-Net v2 训练/预测/评价接口、
+实验记录和文档。仓库不包含患者数据、人工 mask、模型 checkpoint 或实验指标。
 
-重要限制：
+医学数据只保存在本地 `workspace`，不会进入 Git。当前工作区中的 `case_001.nii.gz` 仅用于
+读取和 GUI smoke 检查；此前 GUI 验收生成的测试 mask 已隔离，不能用于正式训练。
 
-- 医学数据不会进入 Git；workspace、DICOM、NIfTI、mask、prediction、checkpoint
-  和 references 都被忽略。
-- Codex 不会猜测髁突区域，也不会生成假 GT。
-- 没有牙医从 3D Slicer 导出的真实非空 mask，就不能声称正式训练、Dice、IoU 或
-  HD95 已完成。
-- 没有兼容 CUDA GPU 时，preprocessing 和 CPU smoke 可以做，但正式 5-fold 训练会
-  标记为 FULL TRAINING BLOCKED BY GPU。
-
-## 快速开始（Windows）
-
-### 最简单使用方法
-
-双击项目根目录的：
-
-    启动下颌髁突标注.bat
-
-启动器会自动寻找已安装的 3D Slicer，临时加载本项目模块，并直接打开
-“下颌髁突三维分割实验平台”。第一次使用不需要进入 Settings，也不需要手动添加
-Additional module paths。
-
-如果希望在桌面使用快捷方式，可运行：
-
-~~~powershell
-powershell -ExecutionPolicy Bypass -File scripts/create_desktop_shortcut.ps1
-~~~
-
-它只会为本项目创建“下颌髁突三维标注”快捷方式，不会修改 Slicer 全局配置。
+## 开发者安装与高级使用
 
 建议使用已安装的 Python 3.10 或 3.11 建立隔离环境。项目脚本可以直接从项目根目录运行。
 
@@ -81,18 +60,13 @@ $env:nnUNet_results = "C:/code/TMJ-Condyle-3D/workspace/nnUNet_results"
 
 ## 从 DICOM 到标注
 
-1. 先用 scripts/inspect_dicom.py 检查 series 数量。输出会主动隐藏 UID 和患者字段。
-2. 用 scripts/dicom_to_nifti.py --case-id case_001 转换唯一 Series。多 Series 时
-   先根据 inspect_dicom.py 返回的匿名 series_index 选择目标序列；也可以在私有
-   本地命令中传入 SeriesInstanceUID。项目不会按文件名猜顺序。
-3. 双击“启动下颌髁突标注.bat”，或在“开发者 / 高级使用”中手工加载本项目模块。
-4. 在“病例与标注”页面点击“下一步：标注髁突”，使用中文“画笔”和
-   “擦除”逐层画髁突；整个流程留在本项目页面，不切换到原生 Segment Editor。
-5. 点击“标完了，检查三维”，查看三视图和 3D 髁突，技术检查通过后保存结果。
-   保存动作会拒绝空标注、非 0/1 标签和 geometry 不一致。
-6. 将病例状态保持为 ANNOTATED 或 VERIFIED，打开“训练数据”检查并准备数据；再在“模型训练”
-   页面开始真实 5 折实验。训练结束后，实验结果页会自动显示 OOF 指标和病例级 GT / Prediction
-   对比；“自动分割”页用于新的 MRI。
+1. 使用 `scripts/inspect_dicom.py` 检查 series 数量。输出会主动隐藏 UID 和患者字段。
+2. 使用 `scripts/dicom_to_nifti.py --case-id case_001` 转换唯一 Series。多 Series 时先根据
+   匿名 `series_index` 选择目标序列；项目不会按文件名猜顺序。
+3. 双击 **启动实验平台.bat**。
+4. 在“病例与标注”页面使用中文“画笔”和“擦除”逐层标出髁突。
+5. 完成技术检查并保存后，点击“确认本例标注”；确认前不会进入训练。
+6. 在“训练数据”中检查并准备数据，再在“模型训练”中开始真实 5 折实验。
 
 详细步骤见 docs/ANNOTATION_GUIDE_zh-CN.md 和 docs/DATASET_GUIDE_zh-CN.md。
 
@@ -201,8 +175,8 @@ python scripts/export_slicer_model.py
         fold_4/checkpoint_final.pth
 
 在 3D Slicer 安装 SlicerNNUnet，设置模型路径，选择 MRI，Apply，检查生成的
-Mandibular Condyle segmentation。人工标注仍通过本项目的“下颌髁突三维标注”工作台
-查看三维结果；详细说明见 docs/SLICER_GUIDE_zh-CN.md。
+Mandibular Condyle segmentation。人工标注和结果查看优先通过本项目的“下颌髁突三维分割实验平台”
+工作台完成；详细说明见 docs/SLICER_GUIDE_zh-CN.md。
 
 ## 参考项目与归属
 

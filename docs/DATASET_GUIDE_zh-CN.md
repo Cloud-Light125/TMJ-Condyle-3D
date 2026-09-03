@@ -56,6 +56,11 @@ shape/spacing/origin/direction 的整数 label map。
 group_id 只能是匿名分组 id，不能是医院 PatientID。manifest 是私有文件，不应提交
 到公开仓库。
 
+病例状态分为 `NEW`（未标注）、`ANNOTATING`（标注中）、`ANNOTATED`（已保存但未确认）、
+`UNVERIFIED`（来源未核实）和 `VERIFIED`（已完成医学复核）。训练数据页和默认构建脚本
+只使用 `VERIFIED`；其它状态即使存在 mask，也不会进入正式训练。只有在高级命令中显式
+传入 `--include-status` 才会覆盖这个默认安全边界。
+
 ## Label 规则
 
 - 0 = background。

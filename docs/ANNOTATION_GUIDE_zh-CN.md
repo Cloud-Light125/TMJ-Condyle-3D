@@ -31,9 +31,9 @@ Mask 是和 MRI 逐体素对应的一张标签图。它不是另一张诊断图�
 
 ## 4. 在 Slicer 中准备
 
-1. 打开 3D Slicer。
-2. 通过 Extension Manager 或 Additional module paths 安装/加载项目中的
-   slicer/TMJCondyleAnnotator。
+1. 安装 3D Slicer。
+2. 双击项目根目录的“启动实验平台.bat”。启动器会自动加载项目模块；普通使用不需要
+   配置 Additional module paths。
 3. 用项目内的命令先把 DICOM 转成 case_001.nii.gz，或者在 Slicer 中打开已有
    的匿名 NIfTI。
 4. 不要把患者姓名放入 Slicer scene 名称、文件名、case id 或截图标题。
@@ -51,7 +51,7 @@ python scripts/dicom_to_nifti.py C:/private/one_case --case-id case_001
 
 ## 5. 选择 MRI 并开始工作
 
-打开“下颌髁突三维标注”后，按顶部固定的四步导航操作：
+打开“下颌髁突三维分割实验平台”后，按顶部固定的四步导航操作：
 
 1. 在“导入核磁”页面点击“选择 MRI”，或使用已经加载的当前病例。
 2. 确认病例编号（例如 `case_001`），点击“下一步：开始标注”。
@@ -149,7 +149,8 @@ python scripts/dicom_to_nifti.py C:/private/one_case --case-id case_001
 
     workspace/labels/case_001.nii.gz
 
-并把 annotation_status 留为 ANNOTATED；复核完成后再改为 VERIFIED。保存后还应
+保存后平台会把 annotation_status 设为 ANNOTATED。请在完成医学复核后点击“确认本例标注”，
+由平台改为 VERIFIED；未确认的病例不能进入正式训练。保存后还应
 在项目根目录运行：
 
 ~~~powershell

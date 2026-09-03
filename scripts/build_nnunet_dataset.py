@@ -16,7 +16,7 @@ from tmj_condyle.config import (
     NNUNET_RAW_DIR,
     REPORTS_DIR,
 )
-from tmj_condyle.data.manifest import read_manifest
+from tmj_condyle.data.manifest import ANNOTATION_STATUSES, read_manifest
 from tmj_condyle.data.nnunet import build_dataset
 from tmj_condyle.data.validation import validate_manifest_dataset
 
@@ -35,13 +35,25 @@ def main() -> int:
     parser.add_argument("--dataset-id", type=int, default=DATASET_ID)
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--seed", type=int, default=DEFAULT_SPLIT_SEED)
+    parser.add_argument(
+        "--include-status",
+        action="append",
+        choices=sorted(ANNOTATION_STATUSES),
+        dest="include_statuses",
+        help="高级覆盖：额外允许指定状态；默认只允许 VERIFIED。可重复传入。",
+    )
     args = parser.parse_args()
+
+    allowed_statuses = {
+        value.upper() for value in (args.include_statuses or ["VERIFIED"])
+    }
 
     rows, valid = validate_manifest_dataset(
         manifest_path=args.manifest,
         images_dir=args.images_dir,
         labels_dir=args.labels_dir,
         report_dir=args.reports_dir,
+        statuses=allowed_statuses,
     )
     if not valid:
         print("Dataset build blocked: validation failed. See dataset_validation.md.")
@@ -50,7 +62,7 @@ def main() -> int:
     selected = [
         row
         for row in manifest_rows
-        if row.get("annotation_status") in {"ANNOTATED", "VERIFIED"}
+        if row.get("annotation_status", "").upper() in allowed_statuses
     ]
     if not selected:
         print("Dataset build blocked: no verified mandibular condyle masks.")
@@ -65,6 +77,7 @@ def main() -> int:
             dataset_id=args.dataset_id,
             n_splits=args.n_splits,
             seed=args.seed,
+            allowed_statuses=allowed_statuses,
         )
     except Exception as exc:  # noqa: BLE001 - CLI reports the actionable cause
         print(f"Dataset build failed: {type(exc).__name__}: {exc}")
