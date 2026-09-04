@@ -1,6 +1,7 @@
 @echo off
 setlocal
-rem The helper creates a shortcut with the user-facing platform name.
-start "" /b PowerShell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0scripts\create_desktop_shortcut.ps1"
-endlocal
-exit /b 0
+rem Use a GUI-hosted runner so shortcut-creation errors are shown in Chinese.
+set "WSCRIPT_EXE=%SystemRoot%\System32\wscript.exe"
+"%WSCRIPT_EXE%" "%~dp0scripts\run_hidden_powershell.vbs" shortcut
+set "EXIT_CODE=%ERRORLEVEL%"
+endlocal & exit /b %EXIT_CODE%

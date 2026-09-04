@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -142,3 +143,24 @@ def test_first_run_state_next_action_and_training_summary_are_explicit():
         "当前电脑没有检测到可用于正式训练的 NVIDIA 显卡" in reason
         for reason in summary["reasons"]
     )
+
+
+def test_windows_entrypoints_are_codepage_safe_and_use_gui_runner():
+    project_root = Path(__file__).resolve().parents[1]
+    entrypoints = [
+        project_root / "启动实验平台.bat",
+        project_root / "创建桌面快捷方式.bat",
+        project_root / "启动下颌髁突标注.bat",
+    ]
+
+    for entrypoint in entrypoints:
+        data = entrypoint.read_bytes()
+        assert data.count(b"\r\n") == data.count(b"\n")
+        assert all(byte < 128 for byte in data)
+        assert b"run_hidden_powershell.vbs" in data
+
+    runner = (project_root / "scripts" / "run_hidden_powershell.vbs").read_text(
+        encoding="utf-8"
+    )
+    assert 'mode = LCase(WScript.Arguments(0))' in runner
+    assert 'U("542F52A85B9E9A8C5E7353F0")' in runner
