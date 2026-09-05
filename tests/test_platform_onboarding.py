@@ -135,6 +135,7 @@ def test_first_run_state_next_action_and_training_summary_are_explicit():
         environment_ready=False,
         gpu_ready=False,
         dataset_prepared=False,
+        gpu_requested=True,
     )
     assert not summary["formal_ready"]
     assert "可用病例：4" in summary["text"]

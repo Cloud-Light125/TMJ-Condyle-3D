@@ -1,8 +1,8 @@
-"""Cross-platform helpers shared by the Windows launcher and Slicer GUI.
+"""Slicer discovery helpers shared by source mode and the packaged GUI.
 
-The launcher itself is a small PowerShell wrapper because ordinary users should
-only need to double-click a file.  The discovery and configuration rules live
-here as well so they can be tested without starting Slicer.
+The release launcher never searches the host for Slicer: it starts the copy at
+``<app-root>\\runtime\\slicer\\Slicer.exe``.  The broader discovery functions
+remain available for source-mode onboarding and for backwards-compatible tests.
 """
 
 from __future__ import annotations
@@ -13,10 +13,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from .runtime import application_root, user_data_dir
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+PROJECT_ROOT = application_root()
 SLICER_CONFIG_NAME = ".tmj_platform_config.json"
-DEFAULT_SLICER_PATH = Path(r"C:\Users\cloudlight\Apps\Slicer5123b\Slicer.exe")
+# Tests and source-mode callers may monkeypatch this value.  A real release
+# never supplies a host-specific default here.
+DEFAULT_SLICER_PATH: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -27,10 +31,25 @@ class SlicerCandidate:
     source: str
 
 
-def slicer_config_path(project_root: str | Path = PROJECT_ROOT) -> Path:
-    """Return the project-local, ignored configuration file."""
+def slicer_config_path(
+    project_root: str | Path = PROJECT_ROOT,
+    *,
+    data_root: str | Path | None = None,
+) -> Path:
+    """Return the writable user configuration path.
 
-    return Path(project_root) / "workspace" / SLICER_CONFIG_NAME
+    The project-root fallback is retained only when source-mode tests do not
+    provide ``TMJ_USER_DATA_DIR``.  Installed builds never write into Program
+    Files.
+    """
+
+    root = Path(project_root).expanduser().resolve()
+    if data_root is not None:
+        return Path(data_root).expanduser().resolve() / SLICER_CONFIG_NAME
+    configured_data = os.environ.get("TMJ_USER_DATA_DIR")
+    if configured_data and root == application_root(project_root):
+        return user_data_dir(configured_data, app_root=root) / SLICER_CONFIG_NAME
+    return root / "workspace" / SLICER_CONFIG_NAME
 
 
 def read_slicer_config(path: str | Path) -> dict[str, object]:
@@ -121,9 +140,9 @@ def discover_slicer_candidates(
 ) -> list[SlicerCandidate]:
     """Find Slicer installations in the documented preference order.
 
-    The fixed path is intentionally first for the current project machine,
-    followed by the user's saved choice and then common Windows locations.
-    Duplicate paths are removed case-insensitively.
+    The bundled runtime is first, followed by the optional test/source default,
+    the user's saved choice and then common Windows locations. Duplicate paths
+    are removed case-insensitively.
     """
 
     root = Path(project_root)
@@ -137,9 +156,12 @@ def discover_slicer_candidates(
     )
     user_profile = Path(_env_value(environment, "USERPROFILE") or Path.home())
 
-    ordered: list[tuple[Path, str]] = [
-        (DEFAULT_SLICER_PATH, "项目默认位置"),
-    ]
+    ordered: list[tuple[Path, str]] = []
+    bundled = root / "runtime" / "slicer" / "Slicer.exe"
+    if bundled.is_file():
+        ordered.append((bundled, "包内 Slicer"))
+    if DEFAULT_SLICER_PATH is not None:
+        ordered.append((DEFAULT_SLICER_PATH, "项目默认位置"))
     configured = configured_slicer_path(root)
     if configured is not None:
         ordered.append((configured, "项目设置"))

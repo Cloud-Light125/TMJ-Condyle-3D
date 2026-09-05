@@ -138,4 +138,73 @@ def generate_case_figures(
         ax.set_zlabel("K")
         ax.legend()
         save_figure(fig, 5, "3d_mask_comparison")
+
+        try:
+            from skimage.measure import marching_cubes
+            from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+        except ImportError as exc:  # pragma: no cover - environment-specific
+            raise RuntimeError(
+                "scikit-image is required for the true 3D surface figure"
+            ) from exc
+
+        def mesh(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+            if not np.any(mask):
+                return None
+            # Padding prevents a surface touching a volume boundary from being
+            # clipped by marching cubes.
+            padded = np.pad(mask.astype(np.uint8), 1, mode="constant")
+            foreground_voxels = int(mask.sum())
+            step_size = (
+                1
+                if foreground_voxels <= 12_000
+                else 2
+                if foreground_voxels <= 40_000
+                else 3
+            )
+            vertices, faces, _, _ = marching_cubes(
+                padded.astype(np.float32),
+                level=0.5,
+                spacing=tuple(float(value) for value in image.GetSpacing()[::-1]),
+                step_size=step_size,
+            )
+            vertices -= np.asarray(image.GetSpacing()[::-1], dtype=float)
+            # marching_cubes returns z-y-x coordinates; the plot is x-y-z.
+            return vertices[:, [2, 1, 0]], faces
+
+        meshes = (
+            (mesh(gt_array), "tab:orange", "GT"),
+            (mesh(pred_array), "deepskyblue", "Prediction"),
+        )
+        fig = plt.figure(figsize=(8, 7))
+        ax = fig.add_subplot(111, projection="3d")
+        plotted_vertices: list[np.ndarray] = []
+        for surface, color, label in meshes:
+            if surface is None:
+                continue
+            vertices, faces = surface
+            plotted_vertices.append(vertices)
+            collection = Poly3DCollection(
+                vertices[faces],
+                alpha=0.52,
+                facecolor=color,
+                edgecolor="none",
+                label=label,
+            )
+            ax.add_collection3d(collection)
+        if plotted_vertices:
+            all_vertices = np.concatenate(plotted_vertices, axis=0)
+            mins = all_vertices.min(axis=0)
+            maxs = all_vertices.max(axis=0)
+            centers = (mins + maxs) / 2.0
+            radius = max(float(np.max(maxs - mins)) / 2.0, 1.0)
+            ax.set_xlim(centers[0] - radius, centers[0] + radius)
+            ax.set_ylim(centers[1] - radius, centers[1] + radius)
+            ax.set_zlim(centers[2] - radius, centers[2] + radius)
+            ax.set_box_aspect((1.0, 1.0, 1.0))
+        ax.set_title("3D surface: GT orange / prediction cyan")
+        ax.set_xlabel("x (mm)")
+        ax.set_ylabel("y (mm)")
+        ax.set_zlabel("z (mm)")
+        ax.legend(loc="upper right")
+        save_figure(fig, 6, "3d_surface")
     return generated

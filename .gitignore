@@ -47,3 +47,10 @@ Thumbs.db
 
 # Local reports may include derived patient data or model outputs.
 *.log
+
+# Generated release staging and local launcher build outputs.  Large runtime
+# binaries, installers and portable archives are kept outside Git.
+/artifacts/
+/packaging/build/
+/packaging/launcher/bin/
+/packaging/launcher/obj/

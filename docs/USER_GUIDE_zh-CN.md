@@ -18,7 +18,7 @@
 - 3D Slicer。
 - 医院提供的 TMJ MRI；本项目不规定医院采集协议。
 - 一位了解颞下颌关节解剖的医生/牙医负责人工标注。
-- 训练阶段需要兼容当前 PyTorch 的 CUDA GPU。
+- 训练默认使用 CPU；如果在训练页主动选择 GPU，则需要兼容当前运行环境的 NVIDIA CUDA GPU。
 
 不要把患者原始文件放进 Git，也不要把患者姓名、PatientID、StudyInstanceUID、
 AccessionNumber、出生日期或医院信息写入 case id、报告或图标题。

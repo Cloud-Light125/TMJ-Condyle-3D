@@ -13,7 +13,7 @@
 4. 五折训练完成后，平台自动执行真实 OOF 预测和 `evaluate_cv.py`，再到“实验结果”选择实验记录、病例和 2D/3D 对比。
 5. 具备完整五折模型后，在“自动分割”选择新 MRI，点击“开始自动分割”。
 
-如果没有至少五个不同患者组，或当前机器没有兼容 CUDA 的 NVIDIA GPU，正式训练按钮会保持不可用。
+如果没有至少五个不同患者组，正式训练按钮会保持不可用。软件默认使用 CPU；只有主动选择 GPU 时才要求检查兼容 CUDA 的 NVIDIA GPU。
 “使用 CPU 测试流程”只验证文件和流程状态，不训练模型，也不生成假结果。技术人员可以在“高级信息”中查看命令、路径和原始日志。
 
 ## 1. 环境
@@ -144,9 +144,9 @@ size、batch size、normalization、resampling、transpose 以及各病例 spaci
 ./scripts/train_all_folds.ps1 -Resume
 ~~~
 
-train_all_folds.py 默认要求先通过 CUDA smoke；如果当前环境没有兼容 GPU，会直接
-输出 FULL TRAINING BLOCKED BY GPU，不会把一次 CPU 运行伪装成正式训练。只有明确
-传入 --device cpu 才会允许 CPU 试运行。training_summary.md 会记录 fold、设备、
+train_all_folds.py 默认使用 CPU。只有传入 --device cuda 时才会先通过 CUDA smoke；
+如果当前环境没有兼容 GPU，会直接输出 FULL TRAINING BLOCKED BY GPU。传入
+--device cpu 会使用 CPU 正式执行。training_summary.md 会记录 fold、设备、
 checkpoint_best/checkpoint_final 状态、耗时和可读取的 validation Dice。
 
 ## 7. OOF 预测与评价

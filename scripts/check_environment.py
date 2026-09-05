@@ -5,8 +5,6 @@ import importlib
 import importlib.metadata
 import json
 import platform
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -23,6 +21,7 @@ from tmj_condyle.config import (
 )
 from tmj_condyle.data.manifest import read_manifest
 from tmj_condyle.data.validation import nifti_files, validate_manifest_dataset
+from tmj_condyle.runtime import nnunet_command, nnunet_module
 
 
 def _version(package: str) -> str:
@@ -33,11 +32,18 @@ def _version(package: str) -> str:
 
 
 def _entrypoint(name: str) -> str | None:
-    local_dir = Path(sys.executable).resolve().parent
-    for candidate in (local_dir / f"{name}.exe", local_dir / name, local_dir / f"{name}.bat"):
-        if candidate.exists():
-            return str(candidate)
-    return shutil.which(name)
+    try:
+        command = nnunet_command(name, python_executable=sys.executable, app_root=PROJECT_ROOT)
+        # Prediction is intentionally emitted as ``python -c`` by the
+        # runtime resolver because nnU-Net 2.8.1's module has a legacy demo
+        # block under ``__main__``.  Validate the importable module rather
+        # than assuming command[2] is always a module name.
+        importlib.import_module(nnunet_module(name))
+    except ValueError:
+        return None
+    except Exception:
+        return None
+    return " ".join(command)
 
 
 def _import_version(module_name: str, package_name: str | None = None) -> tuple[str, object | None]:
@@ -76,16 +82,17 @@ def _cuda_report(torch_module: object | None) -> dict[str, object]:
 
 
 def _write_lock(path: Path) -> None:
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "freeze"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    distributions = []
+    for distribution in importlib.metadata.distributions():
+        name = distribution.metadata.get("Name")
+        version = distribution.version
+        if name and version:
+            distributions.append(f"{name}=={version}")
     path.write_text(
         "# Generated from the active project environment by check_environment.py\n"
         "# This file records the environment that was actually inspected.\n"
-        + result.stdout,
+        + "\n".join(sorted(set(distributions), key=str.casefold))
+        + "\n",
         encoding="utf-8",
     )
 
@@ -97,6 +104,8 @@ def collect_environment_report(manifest: Path = MANIFEST_PATH) -> dict[str, obje
     sitk_version, _ = _import_version("SimpleITK", "SimpleITK")
     nibabel_version, _ = _import_version("nibabel")
     scipy_version, _ = _import_version("scipy")
+    skimage_version, _ = _import_version("skimage", "scikit-image")
+    pandas_version, _ = _import_version("pandas")
     torch_version, torch = _import_version("torch")
     nnunet_version, _ = _import_version("nnunetv2", "nnunetv2")
     entrypoints = {
@@ -156,6 +165,8 @@ def collect_environment_report(manifest: Path = MANIFEST_PATH) -> dict[str, obje
             "SimpleITK": sitk_version,
             "nibabel": nibabel_version,
             "scipy": scipy_version,
+            "scikit-image": skimage_version,
+            "pandas": pandas_version,
             "torch": torch_version,
             "nnunetv2": nnunet_version,
         },
@@ -169,6 +180,15 @@ def collect_environment_report(manifest: Path = MANIFEST_PATH) -> dict[str, obje
             "nnUNet_results": str(NNUNET_RESULTS_DIR),
             "reports": str(REPORTS_DIR),
         },
+        "runtime": {
+            "mode": "packaged" if (PROJECT_ROOT / "runtime").is_dir() else "source",
+            "app_root": str(PROJECT_ROOT),
+            "python": str(Path(sys.executable).resolve()),
+            "environment": {
+                "PYTHONHOME": "isolated",
+                "PYTHONPATH": "application root only",
+            },
+        },
         "image_count": image_count,
         "label_count": label_count,
         "validated_case_count": len(validation_rows),
@@ -180,7 +200,9 @@ def collect_environment_report(manifest: Path = MANIFEST_PATH) -> dict[str, obje
         "data_ready": data_ready,
         "nnunet_ready": env_ready,
         "gpu_ready": gpu_ready,
-        "formal_training_ready": data_ready and env_ready and gpu_ready,
+        # Formal training defaults to CPU.  GPU is optional and is checked
+        # only when the user explicitly selects it in the training page.
+        "formal_training_ready": data_ready and env_ready,
         "missing_labels": [
             row.get("case_id")
             for row in validation_rows
@@ -225,9 +247,6 @@ def main() -> int:
         print("READY FOR ANNOTATION" if report["image_count"] > 0 and report["packages"]["SimpleITK"] != "NOT INSTALLED" else "NOT READY FOR ANNOTATION")
         if report["formal_training_ready"]:
             print("READY FOR TRAINING")
-        elif report["nnunet_ready"] and not report["gpu_ready"]:
-            print("FULL TRAINING BLOCKED BY GPU")
-            print("NOT READY")
         else:
             print("NOT READY")
 

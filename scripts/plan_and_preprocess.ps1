@@ -5,20 +5,25 @@ param(
 )
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$python = Join-Path $projectRoot ".venv/Scripts/python.exe"
-if (-not (Test-Path -LiteralPath $python)) {
-    $python = "python"
+$python = Join-Path $projectRoot "runtime/python/python.exe"
+if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+    $python = Join-Path $projectRoot ".venv/Scripts/python.exe"
 }
-$env:nnUNet_raw = Join-Path $projectRoot "workspace/nnUNet_raw"
-$env:nnUNet_preprocessed = Join-Path $projectRoot "workspace/nnUNet_preprocessed"
-$env:nnUNet_results = Join-Path $projectRoot "workspace/nnUNet_results"
-$venvScripts = Join-Path $projectRoot ".venv/Scripts"
-$env:Path = "$venvScripts;$env:Path"
-
-$planner = Get-Command nnUNetv2_plan_and_preprocess -ErrorAction SilentlyContinue
-if (-not $planner) {
-    Write-Error "nnUNetv2_plan_and_preprocess was not found. Install requirements/nnunet-v2.txt."
+if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+    Write-Error "项目内 Python runtime 不存在；请重新安装软件或从开发环境运行。"
     exit 2
 }
-& $planner.Source -d $DatasetId --verify_dataset_integrity -c $Configuration
+$documents = [Environment]::GetFolderPath('MyDocuments')
+$workspace = Join-Path $documents 'TMJ-Condyle-3D\workspace'
+$env:TMJ_APP_ROOT = $projectRoot
+$env:TMJ_USER_DATA_DIR = $workspace
+$env:nnUNet_raw = Join-Path $workspace 'nnUNet_raw'
+$env:nnUNet_preprocessed = Join-Path $workspace 'nnUNet_preprocessed'
+$env:nnUNet_results = Join-Path $workspace 'nnUNet_results'
+Remove-Item Env:PYTHONHOME -ErrorAction SilentlyContinue
+Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+Remove-Item Env:PYTHONUSERBASE -ErrorAction SilentlyContinue
+$env:PYTHONNOUSERSITE = '1'
+$arguments = @('-m', 'nnunetv2.experiment_planning.plan_and_preprocess_entrypoints', '-d', $DatasetId, '--verify_dataset_integrity', '-c', $Configuration)
+& $python @arguments
 exit $LASTEXITCODE

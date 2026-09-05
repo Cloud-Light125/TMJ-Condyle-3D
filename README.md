@@ -58,6 +58,20 @@ $env:nnUNet_preprocessed = "C:/code/TMJ-Condyle-3D/workspace/nnUNet_preprocessed
 $env:nnUNet_results = "C:/code/TMJ-Condyle-3D/workspace/nnUNet_results"
 ~~~
 
+## 仅测试：synthetic MRI 与真实 nnU-Net v2 链路
+
+如需验证 planner、5 折短训练、OOF evaluation、新病例 inference、Dice/IoU/HD95 和 3D surface，
+请只运行：
+
+~~~powershell
+./.venv/Scripts/python.exe scripts/run_test_only_synthetic.py
+~~~
+
+该脚本使用 `Dataset999_TMJTestOnly` 和 `nnUNetTrainer_TMJTestOnly_1epoch`，生成约 10 个可控
+椭球/髁突状 synthetic MRI，并将数据、preprocessed、checkpoint、prediction、指标和图像全部
+隔离到 `workspace/test_only_tmj_synthetic/`。这些文件明确禁止作为论文或正式实验结果；正式
+训练仍只能使用下方的真实、已确认标注流程。
+
 ## 从 DICOM 到标注
 
 1. 使用 `scripts/inspect_dicom.py` 检查 series 数量。输出会主动隐藏 UID 和患者字段。

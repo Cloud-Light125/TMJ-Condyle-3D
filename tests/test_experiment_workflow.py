@@ -77,7 +77,7 @@ def test_home_state_machine_and_real_script_commands_are_explicit(tmp_path):
         resume=True,
     )
     assert train[1].endswith("train_all_folds.py")
-    assert {"--plan", "--resume", "--device", "cuda"}.issubset(train)
+    assert {"--plan", "--resume", "--device", "cpu"}.issubset(train)
     predict = prediction_command(
         tmp_path / "new_case.nii.gz",
         tmp_path / "prediction.nii.gz",
@@ -85,7 +85,7 @@ def test_home_state_machine_and_real_script_commands_are_explicit(tmp_path):
         python_executable="python",
     )
     assert predict[1].endswith("predict.py")
-    assert "--device" in predict and "cuda" in predict
+    assert "--device" in predict and "cpu" in predict
 
 
 def test_gpu_block_is_not_misreported_as_formal_ready():
@@ -96,11 +96,26 @@ def test_gpu_block_is_not_misreported_as_formal_ready():
         environment_ready=True,
         gpu_ready=False,
         dataset_prepared=True,
+        gpu_requested=True,
     )
     assert readiness.pipeline_ready
     assert not readiness.formal_ready
     assert readiness.level == "blocked_gpu"
     assert "NVIDIA" in " ".join(readiness.reasons)
+
+
+def test_cpu_is_ready_without_cuda_when_other_requirements_pass():
+    readiness = assess_training_readiness(
+        annotated_cases=5,
+        group_count=5,
+        validation_passed=True,
+        environment_ready=True,
+        gpu_ready=False,
+        dataset_prepared=True,
+    )
+    assert readiness.formal_ready
+    assert readiness.level == "ready"
+    assert not any("NVIDIA" in reason for reason in readiness.reasons)
 
 
 def test_case_inventory_and_counts_use_real_annotation_status(tmp_path):

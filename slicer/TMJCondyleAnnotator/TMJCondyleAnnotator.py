@@ -76,6 +76,7 @@ from tmj_condyle.experiment import (  # noqa: E402
     user_training_message,
     should_show_first_run_wizard,
 )
+from tmj_condyle.config import USER_DATA_DIR, ensure_workspace_dirs  # noqa: E402
 from tmj_condyle.data.manifest import read_manifest  # noqa: E402
 from tmj_condyle.launcher import (  # noqa: E402
     configured_slicer_path,
@@ -83,6 +84,7 @@ from tmj_condyle.launcher import (  # noqa: E402
     slicer_config_path,
     write_slicer_config,
 )
+from tmj_condyle.runtime import runtime_environment  # noqa: E402
 
 
 CASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -166,9 +168,11 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         super().setup()
 
         self.projectRoot = Path(__file__).resolve().parents[2]
-        self.niftiDir = self.projectRoot / "workspace" / "nifti"
-        self.labelsDir = self.projectRoot / "workspace" / "labels"
-        self.manifestPath = self.projectRoot / "workspace" / "dataset_manifest.csv"
+        self.workspaceRoot = Path(USER_DATA_DIR).resolve()
+        ensure_workspace_dirs()
+        self.niftiDir = self.workspaceRoot / "nifti"
+        self.labelsDir = self.workspaceRoot / "labels"
+        self.manifestPath = self.workspaceRoot / "dataset_manifest.csv"
 
         self.volumeNode = None
         self.segmentationNode = None
@@ -224,11 +228,13 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self._processStopRequested = False
         self._environmentReport = None
         self._validationRows = read_validation_csv(
-            self.projectRoot / "workspace" / "reports" / "dataset_validation.csv"
+            self.workspaceRoot / "reports" / "dataset_validation.csv"
         )
         self._validationPassed = False
         self._datasetPrepared = False
         self._preprocessingPrepared = False
+        self._trainingDevice = "cpu"
+        self._activeTrainingDevice = "cpu"
         self._trainingFoldEvents = {}
         self._activeTrainingFold = None
         self._currentRunDir = None
@@ -1379,6 +1385,21 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         modelLayout.addRow("实验方式：", qt.QLabel("5 组交叉验证"))
         layout.addWidget(modelCard)
 
+        deviceRow = qt.QHBoxLayout()
+        deviceRow.addWidget(qt.QLabel("训练设备："))
+        self.trainingDeviceCombo = qt.QComboBox()
+        self.trainingDeviceCombo.addItem("CPU（默认，兼容所有电脑）", "cpu")
+        self.trainingDeviceCombo.addItem("GPU（需要兼容 NVIDIA CUDA/驱动）", "cuda")
+        self.trainingDeviceCombo.currentIndexChanged.connect(self._onTrainingDeviceChanged)
+        deviceRow.addWidget(self.trainingDeviceCombo, 1)
+        layout.addLayout(deviceRow)
+        self.trainingDeviceHintLabel = qt.QLabel(
+            "默认使用 CPU。只有主动选择 GPU 时才会检查 CUDA。"
+        )
+        self.trainingDeviceHintLabel.setObjectName("mutedLabel")
+        self.trainingDeviceHintLabel.setWordWrap(True)
+        layout.addWidget(self.trainingDeviceHintLabel)
+
         self.trainingEnvironmentLabel = qt.QLabel("正在准备系统检查…")
         self.trainingEnvironmentLabel.setObjectName("resultMessage")
         self.trainingEnvironmentLabel.setWordWrap(True)
@@ -1645,7 +1666,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         advancedRow = qt.QHBoxLayout()
         self.settingsOpenProjectButton = self._secondaryButton("打开项目目录")
         self.settingsOpenProjectButton.clicked.connect(
-            lambda checked=False: self._openProjectPath(self.projectRoot)
+            lambda checked=False: self._openProjectPath(self.workspaceRoot)
         )
         advancedRow.addWidget(self.settingsOpenProjectButton)
         self.settingsOpenLogButton = self._secondaryButton("查看日志")
@@ -1654,7 +1675,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.settingsOpenModelButton = self._secondaryButton("查看模型目录")
         self.settingsOpenModelButton.clicked.connect(
             lambda checked=False: self._openProjectPath(
-                self.projectRoot / "workspace" / "nnUNet_results"
+                self.workspaceRoot / "nnUNet_results"
             )
         )
         advancedRow.addWidget(self.settingsOpenModelButton)
@@ -1857,12 +1878,17 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             # not leak into the project's external interpreter, otherwise
             # Python can mix Slicer's stdlib with the venv and fail with
             # ``SRE module mismatch`` before any project script starts.
+            runtime_env = runtime_environment(
+                app_root=self.projectRoot,
+                data_root=self.workspaceRoot,
+                base=os.environ,
+                include_pythonpath=True,
+            )
             environment.remove("PYTHONHOME")
             environment.remove("PYTHONPATH")
-            environment.insert("PYTHONPATH", projectRoot)
-            environment.insert("nnUNet_raw", str((self.projectRoot / "workspace" / "nnUNet_raw").resolve()))
-            environment.insert("nnUNet_preprocessed", str((self.projectRoot / "workspace" / "nnUNet_preprocessed").resolve()))
-            environment.insert("nnUNet_results", str((self.projectRoot / "workspace" / "nnUNet_results").resolve()))
+            environment.remove("PYTHONUSERBASE")
+            for name, value in runtime_env.items():
+                environment.insert(str(name), str(value))
             process.setProcessEnvironment(environment)
             process.setWorkingDirectory(projectRoot)
             try:
@@ -2052,7 +2078,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
     def _startEnvironmentCheck(self):
         if self._process is not None:
             return False
-        self.trainingEnvironmentLabel.setText("正在检查 Python、nnU-Net、训练数据和显卡…")
+        self.trainingEnvironmentLabel.setText("正在检查 Python、nnU-Net、训练数据和可选 GPU…")
         return self._startExternalProcess(
             "environment",
             environment_command(project_root=self.projectRoot, python_executable=project_python_executable(self.projectRoot)),
@@ -2100,7 +2126,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self.trainingEnvironmentLabel.setText(
                 "训练环境：nnU-Net　{nnunet} {nnunet_text}\n"
                 "训练数据：{data_text}\n"
-                "显卡：{gpu_message}".format(
+                "GPU（可选）：{gpu_message}".format(
                     **display,
                     nnunet_text="已安装" if display["nnunet"] == "✓" else "未安装",
                     data_text="已准备" if display["data"] == "✓" else "未准备",
@@ -2108,8 +2134,8 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             )
             if display["gpu"] != "✓":
                 self.trainingGpuWarningLabel.setText(
-                    "当前电脑没有检测到可用于训练的 NVIDIA 显卡。\n"
-                    "可以使用“CPU 测试流程”检查软件连接，或稍后在有兼容显卡的电脑正式训练。"
+                    "当前没有检测到可用 CUDA/NVIDIA GPU；默认 CPU 训练和其它功能仍可使用。\n"
+                    "只有选择 GPU 时才需要安装兼容的 NVIDIA 显卡驱动和 GPU 版运行环境。"
                 )
             else:
                 self.trainingGpuWarningLabel.clear()
@@ -2129,7 +2155,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self._setStatusMessage("系统检查没有完整通过，请查看训练页提示。", "warning")
 
     def _finishDatasetValidation(self, exitCode):
-        self._validationRows = read_validation_csv(self.projectRoot / "workspace" / "reports" / "dataset_validation.csv")
+        self._validationRows = read_validation_csv(self.workspaceRoot / "reports" / "dataset_validation.csv")
         inventory, _ = self._inventoryAndCounts()
         self._validationPassed = (
             exitCode == 0
@@ -2156,8 +2182,8 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self._setStatusMessage("数据检查未通过，正式实验暂时不能开始。", "warning")
 
     def _finishDatasetBuild(self, exitCode):
-        datasetPath = self.projectRoot / "workspace" / "nnUNet_raw" / "Dataset501_CondyleMRI" / "dataset.json"
-        splitPath = self.projectRoot / "workspace" / "nnUNet_preprocessed" / "Dataset501_CondyleMRI" / "splits_final.json"
+        datasetPath = self.workspaceRoot / "nnUNet_raw" / "Dataset501_CondyleMRI" / "dataset.json"
+        splitPath = self.workspaceRoot / "nnUNet_preprocessed" / "Dataset501_CondyleMRI" / "splits_final.json"
         try:
             splitCount = len(read_splits(splitPath)) if splitPath.exists() else 0
         except Exception:
@@ -2226,15 +2252,13 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
 
         self._validationPassed = self._validationPassesVerifiedInventory(inventory)
         datasetPath = (
-            self.projectRoot
-            / "workspace"
+            self.workspaceRoot
             / "nnUNet_raw"
             / "Dataset501_CondyleMRI"
             / "dataset.json"
         )
         splitPath = (
-            self.projectRoot
-            / "workspace"
+            self.workspaceRoot
             / "nnUNet_preprocessed"
             / "Dataset501_CondyleMRI"
             / "splits_final.json"
@@ -2252,15 +2276,13 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             and int(counts.get("trainable", 0)) >= len(FOLDS)
         )
         fingerprintPath = (
-            self.projectRoot
-            / "workspace"
+            self.workspaceRoot
             / "nnUNet_preprocessed"
             / "Dataset501_CondyleMRI"
             / "dataset_fingerprint.json"
         )
         plansPath = (
-            self.projectRoot
-            / "workspace"
+            self.workspaceRoot
             / "nnUNet_preprocessed"
             / "Dataset501_CondyleMRI"
             / "nnUNetPlans.json"
@@ -2335,14 +2357,14 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.checkDatasetButton.setEnabled(self._process is None)
         self.datasetAdvancedLabel.setText(
             "高级信息：\n"
-            f"Dataset501_CondyleMRI：{self.projectRoot / 'workspace' / 'nnUNet_raw' / 'Dataset501_CondyleMRI'}\n"
-            f"splits_final.json：{self.projectRoot / 'workspace' / 'nnUNet_preprocessed' / 'Dataset501_CondyleMRI' / 'splits_final.json'}"
+            f"Dataset501_CondyleMRI：{self.workspaceRoot / 'nnUNet_raw' / 'Dataset501_CondyleMRI'}\n"
+            f"splits_final.json：{self.workspaceRoot / 'nnUNet_preprocessed' / 'Dataset501_CondyleMRI' / 'splits_final.json'}"
         )
 
     def _refreshTrainingFoldList(self):
         if not hasattr(self, "trainingFoldList"):
             return
-        states = detect_fold_states(fold_results_directory(results_root=self.projectRoot / "workspace" / "nnUNet_results"))
+        states = detect_fold_states(fold_results_directory(results_root=self.workspaceRoot / "nnUNet_results"))
         self.trainingFoldList.clear()
         for state in states:
             event = self._trainingFoldEvents.get(state.fold, {})
@@ -2368,13 +2390,13 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         if not hasattr(self, "trainingStartButton"):
             return
         if not self._validationRows:
-            self._validationRows = read_validation_csv(self.projectRoot / "workspace" / "reports" / "dataset_validation.csv")
+            self._validationRows = read_validation_csv(self.workspaceRoot / "reports" / "dataset_validation.csv")
         inventory, counts = self._inventoryAndCounts()
         self._validationPassed = self._validationPassesVerifiedInventory(inventory)
-        splitPath = self.projectRoot / "workspace" / "nnUNet_preprocessed" / "Dataset501_CondyleMRI" / "splits_final.json"
-        datasetPath = self.projectRoot / "workspace" / "nnUNet_raw" / "Dataset501_CondyleMRI" / "dataset.json"
-        fingerprintPath = self.projectRoot / "workspace" / "nnUNet_preprocessed" / "Dataset501_CondyleMRI" / "dataset_fingerprint.json"
-        plansPath = self.projectRoot / "workspace" / "nnUNet_preprocessed" / "Dataset501_CondyleMRI" / "nnUNetPlans.json"
+        splitPath = self.workspaceRoot / "nnUNet_preprocessed" / "Dataset501_CondyleMRI" / "splits_final.json"
+        datasetPath = self.workspaceRoot / "nnUNet_raw" / "Dataset501_CondyleMRI" / "dataset.json"
+        fingerprintPath = self.workspaceRoot / "nnUNet_preprocessed" / "Dataset501_CondyleMRI" / "dataset_fingerprint.json"
+        plansPath = self.workspaceRoot / "nnUNet_preprocessed" / "Dataset501_CondyleMRI" / "nnUNetPlans.json"
         self._datasetPrepared = bool(
             datasetPath.exists()
             and splitPath.exists()
@@ -2391,6 +2413,8 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             and isinstance(self._environmentReport.get("cuda"), dict)
             and self._environmentReport["cuda"].get("status") == "PASS"
         )
+        selectedDevice = self._selectedTrainingDevice()
+        gpuRequested = selectedDevice == "cuda"
         envReady = bool(self._environmentReport and self._environmentReport.get("nnunet_ready"))
         readiness = assess_training_readiness(
             annotated_cases=int(counts.get("verified", 0)),
@@ -2399,23 +2423,27 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             environment_ready=envReady,
             gpu_ready=cudaReady,
             dataset_prepared=self._datasetPrepared,
+            gpu_requested=gpuRequested,
         )
         self.trainingReadinessLabel.setText(
             ("✓ " if readiness.formal_ready else "") + readiness.message
             + ("\n" + "\n".join(readiness.reasons) if readiness.reasons and not readiness.formal_ready else "")
         )
         self._refreshTrainingFoldList()
-        states = detect_fold_states(fold_results_directory(results_root=self.projectRoot / "workspace" / "nnUNet_results"))
+        states = detect_fold_states(fold_results_directory(results_root=self.workspaceRoot / "nnUNet_results"))
         incomplete = any(state.resumable for state in states)
         running = self._process is not None
         self.trainingStartButton.setEnabled(readiness.formal_ready and not running)
         self.trainingResumeButton.setEnabled(readiness.formal_ready and incomplete and not running)
+        self.trainingDeviceCombo.setEnabled(not running)
         self.trainingStopButton.setEnabled(running and self._processKind in {"training", "oof", "evaluation"})
         self.cpuSmokeButton.setEnabled(readiness.pipeline_ready and not running)
         self.trainingDetailsButton.setEnabled(bool(self._processOutput or self._currentRunDir))
         if not running and self._processKind == "":
             if readiness.level == "blocked_gpu":
-                self.trainingStageLabel.setText("当前机器暂不适合正式训练。可以先运行 CPU 流程检查。")
+                self.trainingStageLabel.setText("已选择 GPU，但当前没有可用 CUDA。请安装兼容环境，或切换为 CPU。")
+            elif selectedDevice == "cpu" and readiness.formal_ready:
+                self.trainingStageLabel.setText("当前使用 CPU（默认），可以开始正式 5 折训练。")
             elif readiness.formal_ready:
                 self.trainingStageLabel.setText("可以开始正式 5 折训练。")
             elif not counts["annotated"]:
@@ -2428,17 +2456,17 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         cuda = self._environmentReport.get("cuda", {}) if self._environmentReport else {}
         packages = self._environmentReport.get("packages", {}) if self._environmentReport else {}
         modelPath = fold_results_directory(
-            results_root=self.projectRoot / "workspace" / "nnUNet_results"
+            results_root=self.workspaceRoot / "nnUNet_results"
         )
         self._currentRunDir = create_experiment_run(
-            workspace_dir=self.projectRoot / "workspace",
+            workspace_dir=self.workspaceRoot,
             config={
                 "case_count": counts.get("total", 0),
                 "annotated_count": counts.get("annotated", 0),
                 "verified_count": counts.get("verified", 0),
                 "group_count": counts.get("verified_group_count", 0),
                 "validation_passed": self._validationPassed,
-                "device": "cuda",
+                "device": self._trainingDevice,
                 "gpu": cuda.get("device_name", "unavailable"),
                 "nnunet_version": packages.get("nnunetv2", "unknown"),
                 "configuration": "3d_fullres",
@@ -2450,6 +2478,48 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         )
         return self._currentRunDir
 
+    def _selectedTrainingDevice(self):
+        """Return the explicit GUI selection, defaulting safely to CPU."""
+
+        if not hasattr(self, "trainingDeviceCombo"):
+            return self._trainingDevice
+        value = self._comboData(
+            self.trainingDeviceCombo,
+            self.trainingDeviceCombo.currentIndex(),
+        )
+        value = str(value or "cpu").strip().lower()
+        if value not in {"cpu", "cuda"}:
+            value = "cpu"
+        self._trainingDevice = value
+        return value
+
+    def _onTrainingDeviceChanged(self, index):
+        del index
+        device = self._selectedTrainingDevice()
+        if device == "cuda":
+            cudaReady = bool(
+                self._environmentReport
+                and isinstance(self._environmentReport.get("cuda"), dict)
+                and self._environmentReport["cuda"].get("status") == "PASS"
+            )
+            if not cudaReady:
+                qt.QMessageBox.warning(
+                    slicer.util.mainWindow(),
+                    "GPU 环境不可用",
+                    "当前电脑没有检测到可用 CUDA/NVIDIA GPU。\n\n"
+                    "请安装兼容的 NVIDIA 显卡驱动和 GPU 版运行环境后再使用 GPU。\n"
+                    "当前 CPU 功能仍可正常使用。",
+                )
+            if hasattr(self, "trainingDeviceHintLabel"):
+                self.trainingDeviceHintLabel.setText(
+                    "GPU 是可选模式；开始训练前会再次检查 CUDA。没有可用 CUDA 时请切换回 CPU。"
+                )
+        elif hasattr(self, "trainingDeviceHintLabel"):
+            self.trainingDeviceHintLabel.setText(
+                "当前使用 CPU（默认）。如需 GPU，请主动选择 GPU 并确保已安装兼容环境。"
+            )
+        self._refreshTrainingPage()
+
     def _startTraining(self, resume=False):
         if self._process is not None:
             return False
@@ -2458,6 +2528,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self._startEnvironmentCheck()
             return False
         self._refreshTrainingPage()
+        selectedDevice = self._selectedTrainingDevice()
         _, counts = self._inventoryAndCounts()
         cudaReady = bool(
             isinstance(self._environmentReport.get("cuda"), dict)
@@ -2470,7 +2541,17 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             environment_ready=bool(self._environmentReport.get("nnunet_ready")),
             gpu_ready=cudaReady,
             dataset_prepared=self._datasetPrepared,
+            gpu_requested=selectedDevice == "cuda",
         )
+        if selectedDevice == "cuda" and not cudaReady:
+            qt.QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "GPU 环境不可用",
+                "当前没有检测到可用 CUDA/NVIDIA GPU。\n\n"
+                "请安装兼容的 NVIDIA 显卡驱动和 GPU 版运行环境后重试，"
+                "或切换为 CPU。",
+            )
+            return False
         if not readiness.formal_ready:
             self._setStatusMessage(readiness.message, "warning")
             return False
@@ -2481,6 +2562,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             environment_ready=bool(self._environmentReport.get("nnunet_ready")),
             gpu_ready=cudaReady,
             dataset_prepared=self._datasetPrepared,
+            gpu_requested=selectedDevice == "cuda",
         )
         confirm = qt.QMessageBox(slicer.util.mainWindow())
         confirm.setIcon(qt.QMessageBox.Information)
@@ -2494,12 +2576,13 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self._setStatusMessage("已取消训练。", "info")
             return False
         runDir = self._ensureExperimentRun(resume=resume)
+        self._activeTrainingDevice = selectedDevice
         self._trainingFoldEvents = {}
         self._activeTrainingFold = None
         self.trainingLogWidget.clear()
         self.trainingStageLabel.setText("正在准备数据和训练任务…")
         command = training_command(
-            device="cuda",
+            device=selectedDevice,
             resume=bool(resume),
             plan=not self._preprocessingPrepared,
             project_root=self.projectRoot,
@@ -2530,7 +2613,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self._startExternalProcess(
             "oof",
             oof_command(
-                device="cuda",
+                device=self._activeTrainingDevice,
                 project_root=self.projectRoot,
                 python_executable=project_python_executable(self.projectRoot),
             ),
@@ -2553,12 +2636,12 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         )
 
     def _finishEvaluation(self, exitCode):
-        if exitCode != 0 or not has_evaluation_results(self.projectRoot / "workspace" / "reports"):
+        if exitCode != 0 or not has_evaluation_results(self.workspaceRoot / "reports"):
             self.trainingStageLabel.setText("评价没有完成，实验结果暂不可用。")
             self._setStatusMessage("评价失败，没有显示假指标。", "warning")
             return
-        summary = read_metrics_summary(self.projectRoot / "workspace" / "reports" / "metrics_summary.csv")
-        rows = read_metrics_csv(self.projectRoot / "workspace" / "reports" / "metrics_per_case.csv")
+        summary = read_metrics_summary(self.workspaceRoot / "reports" / "metrics_summary.csv")
+        rows = read_metrics_csv(self.workspaceRoot / "reports" / "metrics_per_case.csv")
         if self._currentRunDir:
             finalize_experiment_run(
                 self._currentRunDir,
@@ -2594,7 +2677,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
     def _finishCpuSmoke(self, exitCode):
         if exitCode == 0:
             self.trainingStageLabel.setText("CPU 流程检查通过；没有运行正式训练，也没有生成实验指标。")
-            self._setStatusMessage("CPU 流程检查完成。正式结果仍需要兼容 CUDA GPU。", "success")
+            self._setStatusMessage("CPU 流程检查完成。正式训练默认使用 CPU；GPU 需要主动选择并通过 CUDA 检查。", "success")
         else:
             self.trainingStageLabel.setText("CPU 流程检查未通过，请查看日志。")
             self._setStatusMessage("CPU 流程检查失败。", "warning")
@@ -2638,7 +2721,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self.resultRunSelector.blockSignals(True)
         try:
             self.resultRunSelector.clear()
-            runs = list_experiment_runs(self.projectRoot / "workspace")
+            runs = list_experiment_runs(self.workspaceRoot)
             for run in runs:
                 record = read_experiment_record(run)
                 summary = record.get("summary", {}) if isinstance(record, dict) else {}
@@ -2649,7 +2732,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
                 if mean is not None:
                     label += f"　Dice {format_metric(mean)}"
                 self.resultRunSelector.addItem(label, str(run))
-            reportRoot = self.projectRoot / "workspace" / "reports"
+            reportRoot = self.workspaceRoot / "reports"
             if has_evaluation_results(reportRoot):
                 self.resultRunSelector.addItem("当前报告（未归档实验）", "__reports__")
             comboCount = self._qtInt(self.resultRunSelector, "count")
@@ -2680,7 +2763,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self._resultRunDir = sourcePath if sourcePath.exists() else None
         else:
             self._resultRunDir = None
-        sourceRoot = self._resultRunDir or (self.projectRoot / "workspace" / "reports")
+        sourceRoot = self._resultRunDir or (self.workspaceRoot / "reports")
         summaryPath = sourceRoot / "metrics_summary.csv"
         casePath = sourceRoot / "metrics_per_case.csv"
         self._resultSummary = read_metrics_summary(summaryPath)
@@ -2773,10 +2856,10 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         if manifestRow is None:
             self._setStatusMessage("这个病例不在匿名 manifest 中，无法显示对比。", "warning")
             return False
-        imagePath = self._resolvePath(manifestRow.get("image_path"), self.projectRoot)
-        labelPath = self._resolvePath(manifestRow.get("label_path"), self.projectRoot)
+        imagePath = self._resolvePath(manifestRow.get("image_path"), self.workspaceRoot)
+        labelPath = self._resolvePath(manifestRow.get("label_path"), self.workspaceRoot)
         predictionPath = (
-            self.projectRoot / "workspace" / "predictions" / "oof" / f"fold_{fold}" / f"{caseId}.nii.gz"
+            self.workspaceRoot / "predictions" / "oof" / f"fold_{fold}" / f"{caseId}.nii.gz"
         ).resolve()
         if not imagePath or not labelPath or not imagePath.exists() or not labelPath.exists() or not predictionPath.exists():
             self._setStatusMessage("GT 或真实 OOF Prediction 文件缺失，不能显示对比。", "warning")
@@ -2944,7 +3027,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self._setStatusMessage("只有已归档的真实实验可以导出；当前没有实验记录。", "warning")
             return False
         selected = qt.QFileDialog.getExistingDirectory(
-            slicer.util.mainWindow(), "选择实验导出目录", str(self.projectRoot / "workspace")
+            slicer.util.mainWindow(), "选择实验导出目录", str(self.workspaceRoot)
         )
         if not selected:
             return False
@@ -3009,7 +3092,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         if not hasattr(self, "predictionModelLabel"):
             return
         states = detect_fold_states(
-            fold_results_directory(results_root=self.projectRoot / "workspace" / "nnUNet_results")
+            fold_results_directory(results_root=self.workspaceRoot / "nnUNet_results")
         )
         modelReady = all(state.completed for state in states)
         if modelReady:
@@ -3035,7 +3118,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             qt.QFileDialog.getOpenFileName(
                 slicer.util.mainWindow(),
                 "选择新的 MRI",
-                str(self.projectRoot / "workspace" / "nifti"),
+                str(self.workspaceRoot / "nifti"),
                 "核磁文件 (*.nii.gz *.nii *.nrrd);;所有文件 (*)",
             )
         )
@@ -3044,7 +3127,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         self._predictionInputPath = Path(selected).resolve()
         caseStem = self._stripImageSuffix(self._predictionInputPath)
         self._predictionOutputPath = (
-            self.projectRoot / "workspace" / "predictions" / f"{caseStem}_condyle.nii.gz"
+            self.workspaceRoot / "predictions" / f"{caseStem}_condyle.nii.gz"
         ).resolve()
         self.predictionInputLabel.setText(str(self._predictionInputPath))
         self.predictionStatusLabel.setText("MRI 已选择，可以开始自动分割。")
@@ -3064,7 +3147,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         command = prediction_command(
             self._predictionInputPath,
             self._predictionOutputPath,
-            device="cuda",
+            device="cpu",
             project_root=self.projectRoot,
             python_executable=project_python_executable(self.projectRoot),
         )
@@ -3321,7 +3404,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         candidates = sorted(
             (
                 path
-                for path in (self.projectRoot / "workspace").rglob("*.log")
+                for path in self.workspaceRoot.rglob("*.log")
                 if path.is_file()
             ),
             key=lambda path: path.stat().st_mtime,
@@ -3363,15 +3446,31 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self.settingsGpuLabel.setText("尚未检测；进入模型训练页会自动检查。")
         detailLines = [
             "平台设置",
+            f"TMJ-Condyle-3D：v{self._buildInfo().get('version', '0.1.0')}",
+            f"Git commit：{self._buildInfo().get('git_commit', 'source')}",
+            f"nnU-Net：{self._buildInfo().get('nnunetv2', '2.8.1')}",
+            f"Slicer：{self._buildInfo().get('slicer', self._slicerVersion())}",
             f"Slicer 配置文件：{slicer_config_path(self.projectRoot)}",
             f"当前 Slicer：{selected or '未找到'}",
             f"项目 Python：{project_python_executable(self.projectRoot)}",
-            f"训练数据目录：{self.projectRoot / 'workspace' / 'nnUNet_raw' / 'Dataset501_CondyleMRI'}",
-            f"工作区：{self.projectRoot / 'workspace'}",
+            f"训练数据目录：{self.workspaceRoot / 'nnUNet_raw' / 'Dataset501_CondyleMRI'}",
+            f"工作区：{self.workspaceRoot}",
         ]
         if report:
             detailLines.append("环境报告：\n" + json.dumps(report, ensure_ascii=False, indent=2))
         self._setDetails("\n".join(str(line) for line in detailLines))
+
+    def _buildInfo(self):
+        """Read non-sensitive release metadata written by the packager."""
+
+        path = self.projectRoot / "build-info.json"
+        if not path.is_file():
+            return {}
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
 
     def _slicerVersion(self):
         try:
@@ -3699,8 +3798,9 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             "7. 在“实验结果”中查看 Dice、IoU 和 HD95\n"
             "8. 选择病例查看人工标注与自动预测的 2D / 3D 对比\n"
             "9. 在“自动分割”中用新的 MRI 测试模型\n\n"
-            "系统只显示真实训练和评价结果；没有足够病例或兼容 CUDA 显卡时，"
-            "会明确提示原因，不会生成假指标。"
+            "系统只显示真实训练和评价结果；没有足够病例时会明确提示原因。"
+            "训练默认使用 CPU，只有主动选择 GPU 时才检查 CUDA/NVIDIA 显卡，"
+            "不会生成假指标。"
         )
         text.setObjectName("mutedLabel")
         text.setWordWrap(True)
@@ -5770,13 +5870,13 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
         if not path:
             return ""
         try:
-            return path.relative_to(self.projectRoot).as_posix()
+            return path.relative_to(self.workspaceRoot).as_posix()
         except ValueError:
             return ""
 
     def _manifestPath(self, path):
         try:
-            return Path(path).resolve().relative_to(self.projectRoot).as_posix()
+            return Path(path).resolve().relative_to(self.workspaceRoot).as_posix()
         except ValueError:
             return ""
 
@@ -6030,7 +6130,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             self.homeStatLabels["trainable"].setText(str(counts["trainable"]))
             foldStates = detect_fold_states(
                 fold_results_directory(
-                    results_root=self.projectRoot / "workspace" / "nnUNet_results"
+                    results_root=self.workspaceRoot / "nnUNet_results"
                 )
             )
             modelReady = all(state.completed for state in foldStates)
@@ -6042,7 +6142,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
                 else "未开始"
             )
             self.homeStatLabels["results"].setText(
-                "可查看" if has_evaluation_results(self.projectRoot / "workspace" / "reports") else "暂无"
+                "可查看" if has_evaluation_results(self.workspaceRoot / "reports") else "暂无"
             )
             self.homeStatLabels["model"].setText(
                 "已准备" if modelReady else "暂无"
@@ -6069,7 +6169,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
                         if hasIncomplete
                         else "未开始"
                     ),
-                    results="可查看" if has_evaluation_results(self.projectRoot / "workspace" / "reports") else "暂无",
+                    results="可查看" if has_evaluation_results(self.workspaceRoot / "reports") else "暂无",
                     prediction="可以使用" if modelReady else "等待模型",
                 )
             )
@@ -6152,7 +6252,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
 
     def _homeNextAction(self, counts):
         states = detect_fold_states(
-            fold_results_directory(results_root=self.projectRoot / "workspace" / "nnUNet_results")
+            fold_results_directory(results_root=self.workspaceRoot / "nnUNet_results")
         )
         return home_next_action(
             total_cases=int(counts.get("total", 0)),
@@ -6163,7 +6263,7 @@ class TMJCondyleAnnotatorWidget(ScriptedLoadableModuleWidget):
             dataset_prepared=self._datasetPrepared,
             training_active=self._processKind in {"training", "oof", "evaluation"},
             model_ready=all(state.completed for state in states),
-            results_ready=has_evaluation_results(self.projectRoot / "workspace" / "reports"),
+            results_ready=has_evaluation_results(self.workspaceRoot / "reports"),
         )
 
     def _updateSaveSummary(self):

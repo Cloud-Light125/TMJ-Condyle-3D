@@ -5,8 +5,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE_DIR = PROJECT_ROOT / "workspace"
+from .runtime import application_root, user_data_dir
+
+PROJECT_ROOT = application_root()
+APP_ROOT = PROJECT_ROOT
+USER_DATA_DIR = user_data_dir(app_root=PROJECT_ROOT)
+WORKSPACE_DIR = USER_DATA_DIR
 RAW_DIR = WORKSPACE_DIR / "raw"
 NIFTI_DIR = WORKSPACE_DIR / "nifti"
 LABELS_DIR = WORKSPACE_DIR / "labels"
@@ -51,21 +55,27 @@ def ensure_workspace_dirs() -> None:
         path.mkdir(parents=True, exist_ok=True)
 
 
-def resolve_project_path(value: str | Path, *, base: Path = PROJECT_ROOT) -> Path:
-    """Resolve a manifest path without interpreting it as a shell command."""
+def resolve_project_path(value: str | Path, *, base: Path | None = None) -> Path:
+    """Resolve a manifest path without interpreting it as a shell command.
+
+    Manifest paths are relative to the writable user-data directory. Absolute
+    paths remain supported for importing a file selected by the user.
+    """
 
     path = Path(value)
-    return path if path.is_absolute() else (base / path).resolve()
+    return path.resolve() if path.is_absolute() else ((base or USER_DATA_DIR) / path).resolve()
 
 
 def manifest_path_for(path: str | Path) -> str:
     """Return a stable project-relative path for the private manifest."""
 
     resolved = Path(path).resolve()
-    try:
-        return resolved.relative_to(PROJECT_ROOT).as_posix()
-    except ValueError:
-        return resolved.as_posix()
+    for root in (USER_DATA_DIR, PROJECT_ROOT):
+        try:
+            return resolved.relative_to(root).as_posix()
+        except ValueError:
+            continue
+    return resolved.as_posix()
 
 
 def validate_case_id(case_id: str) -> str:

@@ -15,7 +15,6 @@ import math
 import os
 import re
 import shutil
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -37,10 +36,13 @@ from .config import (
     resolve_project_path,
 )
 from .data.manifest import read_manifest
+from .runtime import runtime_python_executable
 
 
 FOLDS = tuple(range(N_FOLDS))
-FORMAL_TRAINING_DEVICE = "cuda"
+# CPU is the portable release default.  GPU is an explicit opt-in from the
+# GUI/CLI and is checked at the moment the user selects it.
+FORMAL_TRAINING_DEVICE = "cpu"
 TRAINER = "nnUNetTrainer"
 PLANS = "nnUNetPlans"
 ANNOTATION_COMPLETE_STATUSES = {"ANNOTATED", "VERIFIED"}
@@ -436,6 +438,7 @@ def training_prerequisite_summary(
     environment_ready: bool,
     gpu_ready: bool,
     dataset_prepared: bool,
+    gpu_requested: bool = False,
 ) -> dict[str, object]:
     """Build the plain-language confirmation summary before formal training."""
 
@@ -452,7 +455,7 @@ def training_prerequisite_summary(
         reasons.append("nnU-Net 训练环境未准备好")
     if not dataset_prepared:
         reasons.append("训练数据尚未生成")
-    if not gpu_ready:
+    if gpu_requested and not gpu_ready:
         reasons.append("当前电脑没有检测到可用于正式训练的 NVIDIA 显卡")
     return {
         "available_cases": cases,
@@ -479,12 +482,14 @@ def assess_training_readiness(
     validation_passed: bool,
     environment_ready: bool,
     gpu_ready: bool,
+    gpu_requested: bool = False,
     dataset_prepared: bool = False,
 ) -> Readiness:
     """Decide whether formal training may start.
 
-    GPU absence is represented as a block for formal training, never silently
-    converted into a CPU result.  ``pipeline_ready`` means that the user can
+    CPU is the default formal-training device.  GPU absence is a block only
+    after the user explicitly requested GPU; it is never silently substituted
+    for an explicit GPU request.  ``pipeline_ready`` means that the user can
     inspect or prepare the pipeline; it does not mean that a model exists.
     """
 
@@ -499,7 +504,7 @@ def assess_training_readiness(
         reasons.append("Python、nnU-Net 或训练依赖还没有准备好。")
     if not dataset_prepared:
         reasons.append("请先点击“准备训练数据”。")
-    if not gpu_ready:
+    if gpu_requested and not gpu_ready:
         reasons.append("当前电脑没有检测到可用于训练的 NVIDIA 显卡。")
 
     pipeline_ready = annotated_cases >= N_FOLDS and group_count >= N_FOLDS and validation_passed
@@ -509,7 +514,7 @@ def assess_training_readiness(
     elif not environment_ready:
         level = "blocked_environment"
         message = "训练环境还没有准备好，请先完成系统检查。"
-    elif not gpu_ready:
+    elif gpu_requested and not gpu_ready:
         level = "blocked_gpu"
         message = "当前机器暂不适合正式训练。"
     elif not dataset_prepared:
@@ -649,20 +654,9 @@ def user_training_message(event: Mapping[str, object]) -> str:
 
 
 def project_python_executable(project_root: str | Path = Path(__file__).resolve().parents[1]) -> str:
-    """Prefer the project's venv; avoid using Slicer's embedded interpreter."""
+    """Return the application-owned Python interpreter as an absolute path."""
 
-    root = Path(project_root)
-    candidates = (
-        root / ".venv" / "Scripts" / "python.exe",
-        root / ".venv" / "bin" / "python",
-    )
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate.resolve())
-    path = shutil.which("python")
-    if path:
-        return path
-    return sys.executable
+    return str(runtime_python_executable(project_root, allow_development_fallback=True))
 
 
 def script_command(
@@ -770,7 +764,11 @@ def environment_display(report: Mapping[str, object] | None) -> dict[str, str]:
         "nnunet": "✓" if data.get("nnunet_ready") else "不可用",
         "data": "✓" if data.get("data_ready") else "未准备",
         "gpu": "✓" if gpu_ready else "不可用",
-        "gpu_message": "已检测到可用 NVIDIA GPU" if gpu_ready else "当前电脑没有检测到可用于训练的 NVIDIA 显卡。",
+        "gpu_message": (
+            "已检测到可用 NVIDIA GPU，可在训练页选择 GPU"
+            if gpu_ready
+            else "未检测到可用 CUDA/NVIDIA GPU；当前默认使用 CPU，选择 GPU 前请安装兼容驱动和 GPU 运行环境。"
+        ),
     }
 
 

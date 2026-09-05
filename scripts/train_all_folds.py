@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -20,28 +19,11 @@ from tmj_condyle.config import (
     NNUNET_RESULTS_DIR,
     REPORTS_DIR,
 )
+from tmj_condyle.runtime import nnunet_command, runtime_environment
 
 
 def _command(executable: str) -> list[str]:
-    local_candidates = [
-        Path(sys.executable).resolve().parent / f"{executable}.exe",
-        Path(sys.executable).resolve().parent / executable,
-        Path(sys.executable).resolve().parent / f"{executable}.bat",
-    ]
-    for candidate in local_candidates:
-        if candidate.exists():
-            return [str(candidate)]
-    found = shutil.which(executable)
-    if found:
-        return [found]
-    modules = {
-        "nnUNetv2_train": "nnunetv2.run.run_training",
-        "nnUNetv2_plan_and_preprocess": "nnunetv2.experiment_planning.plan_and_preprocess_entrypoints",
-    }
-    module = modules.get(executable)
-    if module is None:
-        raise RuntimeError(f"No Python-module fallback is defined for {executable}")
-    return [sys.executable, "-m", module]
+    return nnunet_command(executable, python_executable=sys.executable, app_root=PROJECT_ROOT)
 
 
 def _metric_from_json(value):
@@ -120,7 +102,7 @@ def main() -> int:
     parser.add_argument("--dataset", default=DATASET_NAME)
     parser.add_argument("--configuration", default=CONFIGURATION, choices=["3d_fullres"])
     parser.add_argument("--folds", default="0,1,2,3,4")
-    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu", "mps"])
+    parser.add_argument("--device", default="cpu", choices=["cuda", "cpu", "mps"])
     parser.add_argument("--trainer", default="nnUNetTrainer")
     parser.add_argument("--plans", default="nnUNetPlans")
     parser.add_argument("--resume", action="store_true", help="Continue incomplete folds with --c.")
@@ -147,13 +129,11 @@ def main() -> int:
         print("FULL TRAINING BLOCKED BY GPU: CUDA is unavailable in the active environment.")
         print("Run check_environment.py and use a verified compatible CUDA/PyTorch environment.")
         return 3
-    env = os.environ.copy()
-    env.update(
-        {
-            "nnUNet_raw": str(NNUNET_RAW_DIR.resolve()),
-            "nnUNet_preprocessed": str(NNUNET_PREPROCESSED_DIR.resolve()),
-            "nnUNet_results": str(NNUNET_RESULTS_DIR.resolve()),
-        }
+    env = runtime_environment(
+        app_root=PROJECT_ROOT,
+        data_root=NNUNET_RAW_DIR.parent,
+        base=os.environ,
+        include_pythonpath=True,
     )
     if args.plan:
         print("TMJ_PLAN_START", flush=True)

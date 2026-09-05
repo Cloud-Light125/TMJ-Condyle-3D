@@ -50,7 +50,8 @@ try {
     $shortcut.WorkingDirectory = $projectRoot
     $shortcut.Description = 'TMJ-Condyle-3D segmentation experiment platform'
     $shortcut.IconLocation = "$wscriptPath,0"
-    $configPath = Join-Path $projectRoot 'workspace\.tmj_platform_config.json'
+    $documents = [Environment]::GetFolderPath('MyDocuments')
+    $configPath = Join-Path $documents 'TMJ-Condyle-3D\workspace\.tmj_platform_config.json'
     if (Test-Path -LiteralPath $configPath -PathType Leaf) {
         try {
             $configured = (Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json).slicer_path

@@ -6,9 +6,15 @@ Add-Type -AssemblyName System.Windows.Forms
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$packagedLauncher = Join-Path $projectRoot 'TMJ-Condyle-3D.exe'
+if (Test-Path -LiteralPath $packagedLauncher -PathType Leaf) {
+    Start-Process -FilePath $packagedLauncher -WorkingDirectory $projectRoot
+    exit 0
+}
 $modulePath = Join-Path $projectRoot 'slicer\TMJCondyleAnnotator'
 $startupScript = Join-Path $projectRoot 'slicer\startup_tmj.py'
-$configPath = Join-Path $projectRoot 'workspace\.tmj_platform_config.json'
+$documents = [Environment]::GetFolderPath('MyDocuments')
+$configPath = Join-Path $documents 'TMJ-Condyle-3D\workspace\.tmj_platform_config.json'
 
 function U([int[]] $codes) {
     return -join ($codes | ForEach-Object { [char]$_ })
@@ -88,7 +94,8 @@ function Add-SlicerCandidate([string] $path, [string] $source) {
 function Find-SlicerCandidates {
     $script:discovered = @()
     $script:seenPaths = @{}
-    Add-SlicerCandidate 'C:\Users\cloudlight\Apps\Slicer5123b\Slicer.exe' '项目默认位置'
+    $bundledSlicer = Join-Path $projectRoot 'runtime\slicer\Slicer.exe'
+    Add-SlicerCandidate $bundledSlicer '包内 Slicer'
     $configured = Read-ConfiguredSlicer
     if ($configured) {
         Add-SlicerCandidate $configured '项目设置'

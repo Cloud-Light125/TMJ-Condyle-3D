@@ -57,7 +57,7 @@ def main() -> int:
     if not np.array_equal(original_array, sitk.GetArrayFromImage(reread)):
         raise RuntimeError("DICOM to NIfTI voxel value verification failed")
 
-    manifest = (args.manifest or (PROJECT_ROOT / "workspace" / "dataset_manifest.csv")).resolve()
+    manifest = (args.manifest or MANIFEST_PATH).resolve()
     existing = find_case(read_manifest(manifest), case_id)
     existing_group_id = existing.get("group_id", "") if existing else ""
     existing_side = existing.get("side", "") if existing else ""

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -22,19 +21,11 @@ from tmj_condyle.config import (
 from tmj_condyle.labels.qc import validate_label_array
 from tmj_condyle.utils.geometry import geometry_differences
 from tmj_condyle.utils.io import read_image, require_simpleitk, write_clean_image
+from tmj_condyle.runtime import nnunet_command, runtime_environment
 
 
 def _predict_command() -> list[str]:
-    local_dir = Path(sys.executable).resolve().parent
-    for candidate in (
-        local_dir / "nnUNetv2_predict.exe",
-        local_dir / "nnUNetv2_predict",
-        local_dir / "nnUNetv2_predict.bat",
-    ):
-        if candidate.exists():
-            return [str(candidate)]
-    found = shutil.which("nnUNetv2_predict")
-    return [found] if found else [sys.executable, "-m", "nnunetv2.inference.predict_from_raw_data"]
+    return nnunet_command("nnUNetv2_predict", python_executable=sys.executable, app_root=PROJECT_ROOT)
 
 
 def main() -> int:
@@ -47,7 +38,7 @@ def main() -> int:
     parser.add_argument("--configuration", default=CONFIGURATION, choices=["3d_fullres"])
     parser.add_argument("--trainer", default="nnUNetTrainer")
     parser.add_argument("--plans", default="nnUNetPlans")
-    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu", "mps"])
+    parser.add_argument("--device", default="cpu", choices=["cuda", "cpu", "mps"])
     parser.add_argument("--keep-workdir", action="store_true")
     args = parser.parse_args()
 
@@ -62,13 +53,11 @@ def main() -> int:
     clean_input = input_dir / f"{case_id}_0000{FILE_ENDING}"
     write_clean_image(image, clean_input)
 
-    env = os.environ.copy()
-    env.update(
-        {
-            "nnUNet_raw": str(NNUNET_RAW_DIR.resolve()),
-            "nnUNet_preprocessed": str(NNUNET_PREPROCESSED_DIR.resolve()),
-            "nnUNet_results": str(NNUNET_RESULTS_DIR.resolve()),
-        }
+    env = runtime_environment(
+        app_root=PROJECT_ROOT,
+        data_root=NNUNET_RAW_DIR.parent,
+        base=os.environ,
+        include_pythonpath=True,
     )
     command = [
         *_predict_command(),

@@ -18,19 +18,11 @@ from tmj_condyle.config import (
     NNUNET_RESULTS_DIR,
     PREDICTIONS_DIR,
 )
+from tmj_condyle.runtime import nnunet_command, runtime_environment
 
 
 def _predict_command() -> list[str]:
-    local_dir = Path(sys.executable).resolve().parent
-    for candidate in (
-        local_dir / "nnUNetv2_predict.exe",
-        local_dir / "nnUNetv2_predict",
-        local_dir / "nnUNetv2_predict.bat",
-    ):
-        if candidate.exists():
-            return [str(candidate)]
-    found = shutil.which("nnUNetv2_predict")
-    return [found] if found else [sys.executable, "-m", "nnunetv2.inference.predict_from_raw_data"]
+    return nnunet_command("nnUNetv2_predict", python_executable=sys.executable, app_root=PROJECT_ROOT)
 
 
 def main() -> int:
@@ -41,7 +33,7 @@ def main() -> int:
     parser.add_argument("--configuration", default=CONFIGURATION, choices=["3d_fullres"])
     parser.add_argument("--trainer", default="nnUNetTrainer")
     parser.add_argument("--plans", default="nnUNetPlans")
-    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu", "mps"])
+    parser.add_argument("--device", default="cpu", choices=["cuda", "cpu", "mps"])
     parser.add_argument("--predictions-root", type=Path, default=PREDICTIONS_DIR / "oof")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
@@ -52,13 +44,11 @@ def main() -> int:
         print("OOF prediction blocked: build the nnU-Net dataset and run preprocessing first.")
         return 2
     splits = json.loads(split_path.read_text(encoding="utf-8"))
-    env = os.environ.copy()
-    env.update(
-        {
-            "nnUNet_raw": str(NNUNET_RAW_DIR.resolve()),
-            "nnUNet_preprocessed": str(NNUNET_PREPROCESSED_DIR.resolve()),
-            "nnUNet_results": str(NNUNET_RESULTS_DIR.resolve()),
-        }
+    env = runtime_environment(
+        app_root=PROJECT_ROOT,
+        data_root=NNUNET_RAW_DIR.parent,
+        base=os.environ,
+        include_pythonpath=True,
     )
     command_base = _predict_command()
     for fold, split in enumerate(splits):
